@@ -85,12 +85,16 @@ fn oauth_client_candidates() -> Vec<GoogleOAuthClient> {
     candidates
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 enum SwitchTarget {
     Desktop,
     Ide,
     Cli,
+    #[serde(rename = "win_cli")]
+    WinCli,
+    #[serde(rename = "wsl_cli")]
+    WslCli,
 }
 
 impl SwitchTarget {
@@ -98,7 +102,8 @@ impl SwitchTarget {
         match self {
             Self::Desktop => "Antigravity",
             Self::Ide => "Antigravity IDE",
-            Self::Cli => "Antigravity CLI (agy)",
+            Self::Cli | Self::WinCli => "Win CLI",
+            Self::WslCli => "WSL CLI",
         }
     }
 }
@@ -125,6 +130,8 @@ struct StoredAccount {
     last_used_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     quota: Option<QuotaData>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_target: Option<SwitchTarget>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -137,6 +144,8 @@ struct AccountStore {
     current_account_id: Option<String>,
     #[serde(default)]
     current_target: Option<SwitchTarget>,
+    #[serde(default)]
+    target_accounts: HashMap<SwitchTarget, String>,
 }
 
 fn default_store_version() -> u8 {
@@ -151,12 +160,15 @@ struct AccountView {
     last_used_at: i64,
     is_current: bool,
     quota: Option<QuotaData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_target: Option<SwitchTarget>,
 }
 
 #[derive(Debug, Serialize)]
 struct AccountListResponse {
     accounts: Vec<AccountView>,
     current_target: Option<SwitchTarget>,
+    target_accounts: HashMap<SwitchTarget, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -418,6 +430,7 @@ fn account_view(account: &StoredAccount, current_id: Option<&str>) -> AccountVie
         last_used_at: account.last_used_at,
         is_current: current_id == Some(account.id.as_str()),
         quota: account.quota.clone(),
+        last_target: account.last_target,
     }
 }
 
@@ -519,6 +532,7 @@ async fn build_account(
         created_at: now,
         last_used_at: 0,
         quota: None,
+        last_target: None,
     })
 }
 
@@ -732,6 +746,7 @@ async fn build_account_from_oauth_token(
         created_at: now,
         last_used_at: 0,
         quota: None,
+        last_target: None,
     })
 }
 
@@ -976,9 +991,17 @@ async fn refresh_stored_account_quota(
 }
 
 #[tauri::command]
-fn list_accounts() -> Result<AccountListResponse, String> {
-    let _guard = STORE_LOCK.lock().map_err(|_| "账号存储锁不可用")?;
-    let store = read_store()?;
+async fn list_accounts() -> Result<AccountListResponse, String> {
+    let store = {
+        let _guard = STORE_LOCK.lock().map_err(|_| "账号存储锁不可用")?;
+        read_store()?
+    };
+    let auto_detected = detect_system_active_accounts(&store).await;
+    let mut merged_targets = store.target_accounts.clone();
+    for (target, email) in auto_detected {
+        merged_targets.insert(target, email);
+    }
+
     Ok(AccountListResponse {
         accounts: store
             .accounts
@@ -986,6 +1009,7 @@ fn list_accounts() -> Result<AccountListResponse, String> {
             .map(|account| account_view(account, store.current_account_id.as_deref()))
             .collect(),
         current_target: store.current_target,
+        target_accounts: merged_targets,
     })
 }
 
@@ -1077,7 +1101,7 @@ fn cancel_oauth_login() {
 async fn import_default_database(
     target: Option<SwitchTarget>,
 ) -> Result<DatabaseImportResult, String> {
-    if target == Some(SwitchTarget::Cli) {
+    if target == Some(SwitchTarget::Cli) || target == Some(SwitchTarget::WinCli) || target == Some(SwitchTarget::WslCli) {
         return import_account_from_keyring().await;
     }
 
@@ -1444,10 +1468,12 @@ async fn switch_account(account_id: String, target: SwitchTarget) -> Result<Stri
             .ok_or("账号在切换过程中被删除。")?;
         *account = fresh;
         account.last_used_at = now_timestamp();
+        account.last_target = Some(target);
         account.email.clone()
     };
     store.current_account_id = Some(account_id);
     store.current_target = Some(target);
+    store.target_accounts.insert(target, email.clone());
     if let Err(error) = write_store(&store) {
         return Err(format!(
             "已将 {email} 写入 {}，但 Agy Switch 未能保存本次切换记录：{error}",
@@ -1456,7 +1482,7 @@ async fn switch_account(account_id: String, target: SwitchTarget) -> Result<Stri
     }
 
     match target {
-        SwitchTarget::Cli => Ok(format!("已将 {email} 切换到 {}。", target.label())),
+        SwitchTarget::Cli | SwitchTarget::WinCli | SwitchTarget::WslCli => Ok(format!("已将 {email} 切换到 {}。", target.label())),
         SwitchTarget::Desktop | SwitchTarget::Ide => match start_target(target) {
             Ok(()) => Ok(format!("已将 {email} 切换到 {}。", target.label())),
             Err(error) => Ok(format!(
@@ -1469,7 +1495,8 @@ async fn switch_account(account_id: String, target: SwitchTarget) -> Result<Stri
 
 fn apply_target_state(account: &StoredAccount, target: SwitchTarget) -> Result<(), String> {
     match target {
-        SwitchTarget::Cli => write_to_system_keyring(account),
+        SwitchTarget::Cli | SwitchTarget::WinCli => write_to_system_keyring(account),
+        SwitchTarget::WslCli => write_to_wsl_cli(account),
         SwitchTarget::Desktop => {
             close_running_target(SwitchTarget::Desktop)?;
             if let Some(db_path) = find_state_db(SwitchTarget::Desktop) {
@@ -1520,21 +1547,35 @@ fn restore_db(backup_path: &Path, db_path: &Path) -> Result<(), String> {
 fn close_running_target(target: SwitchTarget) -> Result<(), String> {
     let mut system = System::new_all();
     system.refresh_processes(ProcessesToUpdate::All);
-    for process in system.processes().values() {
-        let name = process.name().to_string_lossy().to_ascii_lowercase();
-        let is_ide = name.contains("antigravity ide") || name.contains("antigravity-ide");
-        let matches = match target {
-            SwitchTarget::Desktop => name.contains("antigravity") && !is_ide,
-            SwitchTarget::Ide => is_ide,
-            SwitchTarget::Cli => false,
-        };
-        if matches {
-            if !process.kill() {
-                return Err(format!("无法关闭正在运行的 {}。", target.label()));
-            }
+
+    let matching_pids: Vec<_> = system
+        .processes()
+        .iter()
+        .filter(|(_, p)| target_matches_process_name(target, &p.name().to_string_lossy()))
+        .map(|(pid, _)| *pid)
+        .collect();
+
+    if matching_pids.is_empty() {
+        return Ok(());
+    }
+
+    for pid in &matching_pids {
+        if let Some(process) = system.process(*pid) {
+            let _ = process.kill();
         }
     }
-    let deadline = Instant::now() + Duration::from_secs(5);
+
+    #[cfg(target_os = "windows")]
+    {
+        if target == SwitchTarget::Desktop {
+            let _ = Command::new("taskkill").args(["/F", "/T", "/IM", "antigravity.exe"]).output();
+        } else if target == SwitchTarget::Ide {
+            let _ = Command::new("taskkill").args(["/F", "/T", "/IM", "Antigravity IDE.exe"]).output();
+            let _ = Command::new("taskkill").args(["/F", "/T", "/IM", "antigravity-ide.exe"]).output();
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(4);
     loop {
         system.refresh_processes(ProcessesToUpdate::All);
         let still_running = system
@@ -1546,11 +1587,11 @@ fn close_running_target(target: SwitchTarget) -> Result<(), String> {
         }
         if Instant::now() >= deadline {
             return Err(format!(
-                "{} 未能在 5 秒内退出；为避免旧会话覆盖新账号，已取消切换。",
+                "{} 未能在 4 秒内完全退出；为避免旧会话覆盖新账号，请手动确认关闭后重试。",
                 target.label()
             ));
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(150));
     }
 }
 
@@ -1558,7 +1599,7 @@ fn find_state_db(target: SwitchTarget) -> Option<PathBuf> {
     let folder = match target {
         SwitchTarget::Desktop => "Antigravity",
         SwitchTarget::Ide => "Antigravity IDE",
-        SwitchTarget::Cli => return None,
+        SwitchTarget::Cli | SwitchTarget::WinCli | SwitchTarget::WslCli => return None,
     };
     let candidates = state_storage_candidates(folder);
     candidates.into_iter().find(|path| path.is_file())
@@ -1574,10 +1615,16 @@ fn state_db_path_in(user_data_dir: PathBuf) -> PathBuf {
 fn target_matches_process_name(target: SwitchTarget, name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     let is_ide = name.contains("antigravity ide") || name.contains("antigravity-ide");
+    let is_self_or_helper = name.contains("agy-switch") || name.contains("agy_switch") || name.contains("antigravity-cli") || name.contains("antigravity-manager") || name.contains("antigravity-proxy");
+    
+    if is_self_or_helper {
+        return false;
+    }
+
     match target {
-        SwitchTarget::Desktop => name.contains("antigravity") && !is_ide,
+        SwitchTarget::Desktop => name == "antigravity.exe" || name == "antigravity" || (name.contains("antigravity") && !is_ide),
         SwitchTarget::Ide => is_ide,
-        SwitchTarget::Cli => false,
+        SwitchTarget::Cli | SwitchTarget::WinCli | SwitchTarget::WslCli => false,
     }
 }
 
@@ -1836,7 +1883,7 @@ fn start_target(target: SwitchTarget) -> Result<(), String> {
         let app = match target {
             SwitchTarget::Desktop => "Antigravity",
             SwitchTarget::Ide => "Antigravity IDE",
-            SwitchTarget::Cli => return Ok(()),
+            SwitchTarget::Cli | SwitchTarget::WinCli | SwitchTarget::WslCli => return Ok(()),
         };
         let output = Command::new("open")
             .args(["-a", app])
@@ -1867,7 +1914,7 @@ fn executable_path(target: SwitchTarget) -> Option<PathBuf> {
     let (folder, executable) = match target {
         SwitchTarget::Desktop => ("Antigravity", "Antigravity"),
         SwitchTarget::Ide => ("Antigravity IDE", "Antigravity IDE"),
-        SwitchTarget::Cli => return None,
+        SwitchTarget::Cli | SwitchTarget::WinCli | SwitchTarget::WslCli => return None,
     };
     let mut candidates = Vec::new();
     #[cfg(target_os = "windows")]
@@ -1907,6 +1954,59 @@ fn executable_path(target: SwitchTarget) -> Option<PathBuf> {
         }
     }
     candidates.into_iter().find(|path| path.is_file())
+}
+
+fn write_to_wsl_cli(account: &StoredAccount) -> Result<(), String> {
+    let _ = write_to_system_keyring(account);
+
+    let expiry = chrono::DateTime::from_timestamp(account.token.expires_at, 0)
+        .unwrap_or_else(Utc::now)
+        .to_rfc3339_opts(SecondsFormat::Micros, true);
+
+    let payload = serde_json::to_string_pretty(&serde_json::json!({
+        "token": {
+            "access_token": account.token.access_token,
+            "token_type": "Bearer",
+            "refresh_token": account.token.refresh_token,
+            "expiry": expiry
+        },
+        "auth_method": "consumer"
+    })).map_err(|e| format!("无法序列化 WSL 凭据：{}", e))?;
+
+    let mut written = false;
+    let wsl_prefixes = ["\\\\wsl.localhost", "\\\\wsl$"];
+
+    for prefix in &wsl_prefixes {
+        let base_path = Path::new(prefix);
+        if base_path.exists() {
+            if let Ok(entries) = fs::read_dir(base_path) {
+                for entry in entries.flatten() {
+                    let home_dir = entry.path().join("home");
+                    if home_dir.exists() {
+                        if let Ok(users) = fs::read_dir(&home_dir) {
+                            for user in users.flatten() {
+                                let cli_dir = user.path().join(".gemini").join("antigravity-cli");
+                                if fs::create_dir_all(&cli_dir).is_ok() {
+                                    let cred_path = cli_dir.join("credentials.json");
+                                    if fs::write(&cred_path, &payload).is_ok() {
+                                        written = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !written {
+        let _ = Command::new("wsl")
+            .args(["--", "sh", "-c", &format!("mkdir -p ~/.gemini/antigravity-cli && echo '{}' > ~/.gemini/antigravity-cli/credentials.json", payload.replace('\'', "'\\''"))])
+            .output();
+    }
+
+    Ok(())
 }
 
 fn write_to_system_keyring(account: &StoredAccount) -> Result<(), String> {
@@ -2258,6 +2358,32 @@ fn read_windows_credential() -> Result<String, String> {
 
 #[cfg(target_os = "windows")]
 fn read_wsl_credential() -> Result<String, String> {
+    let wsl_prefixes = ["\\\\wsl.localhost", "\\\\wsl$"];
+    for prefix in &wsl_prefixes {
+        let base_path = Path::new(prefix);
+        if base_path.exists() {
+            if let Ok(entries) = fs::read_dir(base_path) {
+                for entry in entries.flatten() {
+                    let home_dir = entry.path().join("home");
+                    if home_dir.exists() {
+                        if let Ok(users) = fs::read_dir(&home_dir) {
+                            for user in users.flatten() {
+                                let cred_path = user.path().join(".gemini").join("antigravity-cli").join("credentials.json");
+                                if cred_path.is_file() {
+                                    if let Ok(content) = fs::read_to_string(&cred_path) {
+                                        if !content.trim().is_empty() {
+                                            return Ok(content);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let output = Command::new("wsl.exe")
         .args(["secret-tool", "lookup", "service", "gemini", "username", "antigravity"])
         .output()
@@ -2268,7 +2394,79 @@ fn read_wsl_credential() -> Result<String, String> {
             return Ok(secret);
         }
     }
-    Err("WSL Secret Service 中未找到凭据。".to_string())
+    Err("WSL 中未找到凭据。".to_string())
+}
+
+async fn detect_system_active_accounts(store: &AccountStore) -> HashMap<SwitchTarget, String> {
+    let mut detected = HashMap::new();
+
+    // 1. Detect Desktop active account
+    for db_path in import_state_db_candidates(Some(SwitchTarget::Desktop)) {
+        if let Ok(db_token) = extract_database_token(&db_path) {
+            if let Some(account) = store.accounts.iter().find(|a| a.token.refresh_token == db_token.refresh_token || a.token.access_token == db_token.refresh_token) {
+                detected.insert(SwitchTarget::Desktop, account.email.clone());
+                break;
+            }
+            if let Ok(email) = fetch_email(&db_token.refresh_token).await {
+                if let Some(account) = store.accounts.iter().find(|a| a.email.eq_ignore_ascii_case(&email)) {
+                    detected.insert(SwitchTarget::Desktop, account.email.clone());
+                    break;
+                }
+            }
+        }
+    }
+
+    // 2. Detect IDE active account
+    for db_path in import_state_db_candidates(Some(SwitchTarget::Ide)) {
+        if let Ok(db_token) = extract_database_token(&db_path) {
+            if let Some(account) = store.accounts.iter().find(|a| a.token.refresh_token == db_token.refresh_token || a.token.access_token == db_token.refresh_token) {
+                detected.insert(SwitchTarget::Ide, account.email.clone());
+                break;
+            }
+            if let Ok(email) = fetch_email(&db_token.refresh_token).await {
+                if let Some(account) = store.accounts.iter().find(|a| a.email.eq_ignore_ascii_case(&email)) {
+                    detected.insert(SwitchTarget::Ide, account.email.clone());
+                    break;
+                }
+            }
+        }
+    }
+
+    // 3. Detect Win CLI active account
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(raw_cred) = read_windows_credential() {
+            if let Ok(rt) = extract_refresh_token_from_keyring(&raw_cred) {
+                if let Some(account) = store.accounts.iter().find(|a| a.token.refresh_token == rt || a.token.access_token == rt) {
+                    detected.insert(SwitchTarget::WinCli, account.email.clone());
+                    detected.insert(SwitchTarget::Cli, account.email.clone());
+                } else if let Ok(email) = fetch_email(&rt).await {
+                    if let Some(account) = store.accounts.iter().find(|a| a.email.eq_ignore_ascii_case(&email)) {
+                        detected.insert(SwitchTarget::WinCli, account.email.clone());
+                        detected.insert(SwitchTarget::Cli, account.email.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Detect WSL CLI active account
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(raw_cred) = read_wsl_credential() {
+            if let Ok(rt) = extract_refresh_token_from_keyring(&raw_cred) {
+                if let Some(account) = store.accounts.iter().find(|a| a.token.refresh_token == rt || a.token.access_token == rt) {
+                    detected.insert(SwitchTarget::WslCli, account.email.clone());
+                } else if let Ok(email) = fetch_email(&rt).await {
+                    if let Some(account) = store.accounts.iter().find(|a| a.email.eq_ignore_ascii_case(&email)) {
+                        detected.insert(SwitchTarget::WslCli, account.email.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    detected
 }
 
 fn inject_token_into_db(db_path: &Path, account: &StoredAccount) -> Result<(), String> {

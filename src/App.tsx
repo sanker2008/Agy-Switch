@@ -29,7 +29,7 @@ import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialo
 import { Language, formatResetTimeI18n, formatTimeI18n, t } from "./i18n";
 import appIcon from "../src-tauri/icons/128x128.png";
 
-type SwitchTarget = "desktop" | "ide" | "cli";
+type SwitchTarget = "desktop" | "ide" | "cli" | "win_cli" | "wsl_cli";
 type AddAccountTab = "oauth" | "token" | "database";
 
 interface Account {
@@ -39,6 +39,7 @@ interface Account {
   last_used_at: number;
   is_current: boolean;
   quota: QuotaData | null;
+  last_target?: SwitchTarget | null;
 }
 
 type DatabaseImportOutcome = "added" | "updated" | "unchanged";
@@ -65,6 +66,7 @@ interface QuotaData {
 interface AccountListResponse {
   accounts: Account[];
   current_target: SwitchTarget | null;
+  target_accounts?: Record<string, string>;
 }
 
 interface ImportResult {
@@ -72,24 +74,30 @@ interface ImportResult {
   updated: number;
 }
 
-const targetLabels: Record<SwitchTarget, string> = {
+const targetLabels: Record<string, string> = {
   desktop: "Antigravity",
   ide: "Antigravity IDE",
-  cli: "Antigravity CLI",
+  cli: "Win CLI",
+  win_cli: "Win CLI",
+  wsl_cli: "WSL CLI",
 };
 
-function getTargetDescriptions(lang: Language): Record<SwitchTarget, string> {
+function getTargetDescriptions(lang: Language): Record<string, string> {
   return {
     desktop: t(lang, "targetDesktopDesc"),
     ide: t(lang, "targetIdeDesc"),
     cli: t(lang, "targetCliDesc"),
+    win_cli: t(lang, "targetCliDesc"),
+    wsl_cli: "写入 WSL Linux 凭据",
   };
 }
 
-const targetIcons: Record<SwitchTarget, typeof Monitor> = {
+const targetIcons: Record<string, typeof Monitor> = {
   desktop: Monitor,
   ide: ChevronRight,
   cli: Terminal,
+  win_cli: Terminal,
+  wsl_cli: Terminal,
 };
 
 async function call<T>(command: string, payload?: Record<string, unknown>): Promise<T> {
@@ -154,6 +162,7 @@ function App() {
   const toggleTheme = () => {
     setTheme((prev) => (prev === "dark" ? "light" : "dark"));
   };
+  const [targetAccounts, setTargetAccounts] = useState<Partial<Record<SwitchTarget, string>>>({});
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [pending, setPending] = useState<string | null>(null);
@@ -173,6 +182,7 @@ function App() {
       const result = await call<AccountListResponse>("list_accounts");
       setAccounts(result.accounts);
       setCurrentTarget(result.current_target);
+      setTargetAccounts(result.target_accounts ?? {});
       setSelectedAccountId((previous) => {
         if (previous && result.accounts.some((account) => account.id === previous)) return previous;
         return result.accounts.find((account) => account.is_current)?.id ?? result.accounts[0]?.id ?? null;
@@ -568,8 +578,8 @@ function App() {
         </div>
 
         <div className="target-switcher" aria-label={t(lang, "switchTarget")}>
-          {(Object.keys(targetLabels) as SwitchTarget[]).map((target) => {
-            const TargetIcon = targetIcons[target];
+          {(["desktop", "ide", "win_cli", "wsl_cli"] as SwitchTarget[]).map((target) => {
+            const TargetIcon = targetIcons[target] || Terminal;
             const key = selectedAccount ? `switch:${selectedAccount.id}:${target}` : "";
             const isRecordedTarget = Boolean(selectedAccount?.is_current && currentTarget === target);
             const descriptions = getTargetDescriptions(lang);
@@ -587,6 +597,29 @@ function App() {
                   <small>{isRecordedTarget ? t(lang, "lastSwitchedTo", { target: "" }).replace("：", "") : descriptions[target]}</small>
                 </span>
               </button>
+            );
+          })}
+        </div>
+      </section>
+
+      {/* 各端当前作用账号一览看板 */}
+      <section className="surface-overview-bar" aria-label="各端当前作用账号一览">
+        <div className="surface-overview-title">
+          <ShieldCheck size={14} />
+          <span>各端当前作用账号一览</span>
+        </div>
+        <div className="surface-overview-items">
+          {(["desktop", "ide", "win_cli", "wsl_cli"] as SwitchTarget[]).map((target) => {
+            const TargetIcon = targetIcons[target] || Terminal;
+            const activeEmail = targetAccounts[target] || (target === "win_cli" && targetAccounts["cli"]) || (currentTarget === target && selectedAccount ? selectedAccount.email : null);
+            return (
+              <div key={target} className={`surface-overview-chip ${activeEmail ? "active" : ""}`}>
+                <div className="surface-chip-header">
+                  <TargetIcon size={15} />
+                  <span className="surface-name">{targetLabels[target]}</span>
+                </div>
+                <div className="surface-email" title={activeEmail || "未切换"}>{activeEmail || "未切换"}</div>
+              </div>
             );
           })}
         </div>
