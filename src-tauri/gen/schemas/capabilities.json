@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Core desktop capability for Agy Switch.","local":true,"windows":["main"],"permissions":["core:default","dialog:default","opener:default"]}}

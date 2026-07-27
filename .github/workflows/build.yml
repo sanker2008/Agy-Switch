@@ -1,0 +1,58 @@
+name: Release & Build Agy Switch
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-tauri:
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: 'windows-latest'
+            target: 'x86_64-pc-windows-msvc'
+            args: ''
+          - platform: 'macos-latest'
+            target: 'aarch64-apple-darwin'
+            args: '--target aarch64-apple-darwin'
+          - platform: 'macos-latest'
+            target: 'x86_64-apple-darwin'
+            args: '--target x86_64-apple-darwin'
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AGY_GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.AGY_GOOGLE_OAUTH_CLIENT_ID }}
+          AGY_GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.AGY_GOOGLE_OAUTH_CLIENT_SECRET }}
+        with:
+          tagName: v__VERSION__
+          releaseName: 'Agy Switch v__VERSION__'
+          releaseBody: 'Automatic build release of Agy Switch for Windows & macOS.'
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}
