@@ -1916,7 +1916,7 @@ fn executable_path(target: SwitchTarget) -> Option<PathBuf> {
         SwitchTarget::Ide => ("Antigravity IDE", "Antigravity IDE"),
         SwitchTarget::Cli | SwitchTarget::WinCli | SwitchTarget::WslCli => return None,
     };
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<PathBuf> = Vec::new();
     #[cfg(target_os = "windows")]
     {
         if let Ok(local) = std::env::var("LOCALAPPDATA") {
