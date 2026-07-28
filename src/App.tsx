@@ -25,6 +25,7 @@ import {
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { Language, formatResetTimeI18n, formatTimeI18n, t } from "./i18n";
 import appIcon from "../src-tauri/icons/128x128.png";
@@ -148,6 +149,7 @@ function App() {
   const [accent, setAccent] = useState<AccentColor>(() => (localStorage.getItem("agy_accent") as AccentColor) || "teal");
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [currentTarget, setCurrentTarget] = useState<SwitchTarget | null>(null);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -158,6 +160,20 @@ function App() {
     document.documentElement.setAttribute("data-accent", accent);
     localStorage.setItem("agy_accent", accent);
   }, [accent]);
+
+  useEffect(() => {
+    let active = true;
+    void getVersion()
+      .then((version) => {
+        if (active) setAppVersion(version);
+      })
+      .catch(() => {
+        // 浏览器预览环境没有 Tauri 运行时，保留空白即可。
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const toggleTheme = () => {
     setTheme((prev) => (prev === "dark" ? "light" : "dark"));
@@ -497,7 +513,10 @@ function App() {
           <img src={appIcon} alt="" className="brand-icon" />
           <div>
             <p className="eyebrow">{t(lang, "appSubtitle")}</p>
-            <h1>{t(lang, "appTitle")}</h1>
+            <div className="brand-title-row">
+              <h1>{t(lang, "appTitle")}</h1>
+              {appVersion && <span className="app-version" title="应用版本">v{appVersion}</span>}
+            </div>
           </div>
         </div>
         <div className="header-actions">
@@ -521,6 +540,8 @@ function App() {
             type="button"
             className="quiet-icon-button"
             onClick={toggleTheme}
+            aria-label={theme === "dark" ? t(lang, "lightMode") : t(lang, "darkMode")}
+            aria-pressed={theme === "dark"}
             title={theme === "dark" ? t(lang, "lightMode") : t(lang, "darkMode")}
           >
             {theme === "dark" ? <Sun size={18} /> : <Moon size={18} />}

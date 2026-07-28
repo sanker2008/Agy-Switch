@@ -451,7 +451,7 @@ async fn refresh_token(refresh_token: &str) -> Result<GoogleTokenResponse, Strin
         if let Some(secret) = oauth_client.secret.as_deref() {
             form.push(("client_secret", secret));
         }
-        let client = quota_http_client()?;
+        let client = google_http_client(GOOGLE_TOKEN_URL)?;
         let response = client
             .post(GOOGLE_TOKEN_URL)
             .form(&form)
@@ -488,7 +488,7 @@ async fn refresh_token(refresh_token: &str) -> Result<GoogleTokenResponse, Strin
 }
 
 async fn fetch_email(access_token: &str) -> Result<String, String> {
-    let response = reqwest::Client::new()
+    let response = google_http_client(GOOGLE_USERINFO_URL)?
         .get(GOOGLE_USERINFO_URL)
         .bearer_auth(access_token)
         .send()
@@ -708,7 +708,7 @@ async fn exchange_oauth_code(
     if let Some(secret) = oauth_client.secret.as_deref() {
         form.push(("client_secret", secret));
     }
-    let response = quota_http_client()?
+    let response = google_http_client(GOOGLE_TOKEN_URL)?
         .post(GOOGLE_TOKEN_URL)
         .form(&form)
         .send()
@@ -811,16 +811,249 @@ fn tier_name(tier: &QuotaTier) -> Option<String> {
     tier.name.clone().or_else(|| tier.id.clone())
 }
 
-fn quota_http_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
+#[cfg(any(target_os = "windows", test))]
+fn proxy_url_from_windows_proxy_list(proxy_list: &str, request_url: &str) -> Option<String> {
+    let request_scheme = Url::parse(request_url).ok()?.scheme().to_ascii_lowercase();
+    let mut fallback = None;
+
+    for entry in proxy_list
+        .split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        if entry.eq_ignore_ascii_case("DIRECT") {
+            continue;
+        }
+
+        let (protocol, endpoint) = entry
+            .split_once('=')
+            .map(|(protocol, endpoint)| {
+                (Some(protocol.trim().to_ascii_lowercase()), endpoint.trim())
+            })
+            .unwrap_or((None, entry));
+        if let Some(protocol) = protocol.as_deref() {
+            if matches!(protocol, "http" | "https") && protocol != request_scheme.as_str() {
+                continue;
+            }
+        }
+
+        let endpoint = endpoint
+            .strip_prefix("PROXY ")
+            .or_else(|| endpoint.strip_prefix("proxy "))
+            .or_else(|| endpoint.strip_prefix("HTTPS "))
+            .or_else(|| endpoint.strip_prefix("https "))
+            .or_else(|| endpoint.strip_prefix("HTTP "))
+            .or_else(|| endpoint.strip_prefix("http "))
+            .or_else(|| endpoint.strip_prefix("SOCKS5 "))
+            .or_else(|| endpoint.strip_prefix("socks5 "))
+            .or_else(|| endpoint.strip_prefix("SOCKS "))
+            .or_else(|| endpoint.strip_prefix("socks "))
+            .unwrap_or(endpoint)
+            .trim();
+        if endpoint.is_empty() || endpoint.eq_ignore_ascii_case("DIRECT") {
+            continue;
+        }
+
+        let url = if endpoint.contains("://") {
+            endpoint.to_string()
+        } else {
+            format!("http://{endpoint}")
+        };
+        if Url::parse(&url)
+            .ok()
+            .filter(|url| url.host_str().is_some())
+            .is_some()
+        {
+            if protocol.as_deref() == Some(request_scheme.as_str()) {
+                return Some(url);
+            }
+            fallback.get_or_insert(url);
+        }
+    }
+
+    fallback
+}
+
+#[cfg(target_os = "windows")]
+fn windows_system_proxy_for_url(request_url: &str) -> Option<String> {
+    use std::{ffi::c_void, os::windows::ffi::OsStrExt, ptr};
+
+    type WinHttpHandle = *mut c_void;
+
+    #[repr(C)]
+    struct CurrentUserIeProxyConfig {
+        auto_detect: i32,
+        auto_config_url: *mut u16,
+        proxy: *mut u16,
+        proxy_bypass: *mut u16,
+    }
+
+    #[repr(C)]
+    struct AutoProxyOptions {
+        flags: u32,
+        auto_detect_flags: u32,
+        auto_config_url: *const u16,
+        reserved: *mut c_void,
+        reserved_flags: u32,
+        auto_logon_if_challenged: i32,
+    }
+
+    #[repr(C)]
+    struct ProxyInfo {
+        access_type: u32,
+        proxy: *mut u16,
+        proxy_bypass: *mut u16,
+    }
+
+    #[link(name = "winhttp")]
+    extern "system" {
+        fn WinHttpOpen(
+            user_agent: *const u16,
+            access_type: u32,
+            proxy_name: *const u16,
+            proxy_bypass: *const u16,
+            flags: u32,
+        ) -> WinHttpHandle;
+        fn WinHttpCloseHandle(handle: WinHttpHandle) -> i32;
+        fn WinHttpGetIEProxyConfigForCurrentUser(config: *mut CurrentUserIeProxyConfig) -> i32;
+        fn WinHttpGetProxyForUrl(
+            session: WinHttpHandle,
+            url: *const u16,
+            options: *const AutoProxyOptions,
+            proxy_info: *mut ProxyInfo,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GlobalFree(memory: *mut c_void) -> *mut c_void;
+    }
+
+    unsafe fn read_and_free_windows_string(value: *mut u16) -> Option<String> {
+        if value.is_null() {
+            return None;
+        }
+        let length = (0..).take_while(|&index| *value.add(index) != 0).count();
+        let result = String::from_utf16_lossy(std::slice::from_raw_parts(value, length));
+        GlobalFree(value.cast());
+        (!result.trim().is_empty()).then_some(result)
+    }
+
+    const WINHTTP_ACCESS_TYPE_NO_PROXY: u32 = 1;
+    const WINHTTP_AUTOPROXY_AUTO_DETECT: u32 = 0x0000_0001;
+    const WINHTTP_AUTOPROXY_CONFIG_URL: u32 = 0x0000_0002;
+    const WINHTTP_AUTO_DETECT_TYPE_DHCP: u32 = 0x0000_0001;
+    const WINHTTP_AUTO_DETECT_TYPE_DNS_A: u32 = 0x0000_0002;
+
+    let mut config = CurrentUserIeProxyConfig {
+        auto_detect: 0,
+        auto_config_url: ptr::null_mut(),
+        proxy: ptr::null_mut(),
+        proxy_bypass: ptr::null_mut(),
+    };
+    unsafe {
+        if WinHttpGetIEProxyConfigForCurrentUser(&mut config) == 0 {
+            return None;
+        }
+        let auto_config_url = read_and_free_windows_string(config.auto_config_url);
+        let static_proxy = read_and_free_windows_string(config.proxy);
+        let _ = read_and_free_windows_string(config.proxy_bypass);
+
+        let (flags, auto_config_url_wide) = if let Some(url) = auto_config_url {
+            (
+                WINHTTP_AUTOPROXY_CONFIG_URL,
+                std::ffi::OsStr::new(&url)
+                    .encode_wide()
+                    .chain(Some(0))
+                    .collect::<Vec<_>>(),
+            )
+        } else if config.auto_detect != 0 {
+            (WINHTTP_AUTOPROXY_AUTO_DETECT, Vec::new())
+        } else {
+            return static_proxy
+                .and_then(|proxy| proxy_url_from_windows_proxy_list(&proxy, request_url));
+        };
+
+        let user_agent = std::ffi::OsStr::new("Agy Switch")
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let request_url_wide = std::ffi::OsStr::new(request_url)
+            .encode_wide()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        let session = WinHttpOpen(
+            user_agent.as_ptr(),
+            WINHTTP_ACCESS_TYPE_NO_PROXY,
+            ptr::null(),
+            ptr::null(),
+            0,
+        );
+        if session.is_null() {
+            return static_proxy
+                .and_then(|proxy| proxy_url_from_windows_proxy_list(&proxy, request_url));
+        }
+
+        let options = AutoProxyOptions {
+            flags,
+            auto_detect_flags: WINHTTP_AUTO_DETECT_TYPE_DHCP | WINHTTP_AUTO_DETECT_TYPE_DNS_A,
+            auto_config_url: (!auto_config_url_wide.is_empty())
+                .then_some(auto_config_url_wide.as_ptr())
+                .unwrap_or(ptr::null()),
+            reserved: ptr::null_mut(),
+            reserved_flags: 0,
+            auto_logon_if_challenged: 0,
+        };
+        let mut proxy_info = ProxyInfo {
+            access_type: 0,
+            proxy: ptr::null_mut(),
+            proxy_bypass: ptr::null_mut(),
+        };
+        let proxy_lookup_succeeded = WinHttpGetProxyForUrl(
+            session,
+            request_url_wide.as_ptr(),
+            &options,
+            &mut proxy_info,
+        ) != 0;
+        let proxy = read_and_free_windows_string(proxy_info.proxy);
+        let _ = read_and_free_windows_string(proxy_info.proxy_bypass);
+        let resolved = if proxy_lookup_succeeded {
+            proxy.and_then(|proxy| proxy_url_from_windows_proxy_list(&proxy, request_url))
+        } else {
+            None
+        };
+        let _ = WinHttpCloseHandle(session);
+
+        if proxy_lookup_succeeded {
+            resolved
+        } else {
+            static_proxy
+                .and_then(|proxy| proxy_url_from_windows_proxy_list(&proxy, request_url))
+        }
+    }
+}
+
+fn google_http_client(request_url: &str) -> Result<reqwest::Client, String> {
+    let builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(20))
+        .timeout(Duration::from_secs(20));
+
+    #[cfg(target_os = "windows")]
+    let builder = if let Some(proxy_url) = windows_system_proxy_for_url(request_url) {
+        builder.proxy(
+            reqwest::Proxy::all(&proxy_url)
+                .map_err(|error| format!("Windows 系统代理配置无效：{error}"))?,
+        )
+    } else {
+        builder
+    };
+
+    builder
         .build()
-        .map_err(|error| format!("无法创建模型配额请求：{error}"))
+        .map_err(|error| format!("无法创建 Google 网络请求：{error}"))
 }
 
 async fn load_code_assist(access_token: &str) -> Result<(Option<String>, Option<String>), String> {
-    let response = quota_http_client()?
+    let response = google_http_client(CLOUD_CODE_LOAD_ASSIST_URL)?
         .post(CLOUD_CODE_LOAD_ASSIST_URL)
         .bearer_auth(access_token)
         .header(reqwest::header::USER_AGENT, QUOTA_USER_AGENT)
@@ -884,13 +1117,13 @@ async fn fetch_available_models(
     project_id: Option<&str>,
     subscription_tier: Option<String>,
 ) -> Result<QuotaData, String> {
-    let client = quota_http_client()?;
     let initial_payload = project_id
         .map(|project| serde_json::json!({ "project": project }))
         .unwrap_or_else(|| serde_json::json!({}));
     let mut last_error = "模型配额服务没有可用响应。".to_string();
 
     for endpoint in QUOTA_API_ENDPOINTS {
+        let client = google_http_client(endpoint)?;
         let mut payload = initial_payload.clone();
         let mut retried_without_project = false;
         loop {
@@ -1445,7 +1678,7 @@ fn delete_account(account_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn switch_account(account_id: String, target: SwitchTarget) -> Result<String, String> {
+fn switch_account(account_id: String, target: SwitchTarget) -> Result<String, String> {
     let stored = {
         let _guard = STORE_LOCK.lock().map_err(|_| "账号存储锁不可用")?;
         let store = read_store()?;
@@ -1455,8 +1688,10 @@ async fn switch_account(account_id: String, target: SwitchTarget) -> Result<Stri
             .find(|account| account.id == account_id)
             .ok_or("账号不存在。")?
     };
-    let fresh = make_fresh(stored).await?;
-    apply_target_state(&fresh, target)?;
+    // Switching only changes local credentials and must stay available offline. The target
+    // application owns refreshing an expired access token after it regains network access.
+    let target_needs_network_refresh = !token_is_fresh(&stored.token);
+    apply_target_state(&stored, target)?;
 
     let _guard = STORE_LOCK.lock().map_err(|_| "账号存储锁不可用")?;
     let mut store = read_store()?;
@@ -1466,7 +1701,7 @@ async fn switch_account(account_id: String, target: SwitchTarget) -> Result<Stri
             .iter_mut()
             .find(|account| account.id == account_id)
             .ok_or("账号在切换过程中被删除。")?;
-        *account = fresh;
+        *account = stored;
         account.last_used_at = now_timestamp();
         account.last_target = Some(target);
         account.email.clone()
@@ -1480,14 +1715,22 @@ async fn switch_account(account_id: String, target: SwitchTarget) -> Result<Stri
             target.label()
         ));
     }
+    let network_refresh_note = if target_needs_network_refresh {
+        " 当前 access token 已过期，目标程序联网后会自行刷新。"
+    } else {
+        ""
+    };
+    let success_message = format!(
+        "已将 {email} 切换到 {}。{network_refresh_note}",
+        target.label()
+    );
 
     match target {
-        SwitchTarget::Cli | SwitchTarget::WinCli | SwitchTarget::WslCli => Ok(format!("已将 {email} 切换到 {}。", target.label())),
+        SwitchTarget::Cli | SwitchTarget::WinCli | SwitchTarget::WslCli => Ok(success_message),
         SwitchTarget::Desktop | SwitchTarget::Ide => match start_target(target) {
-            Ok(()) => Ok(format!("已将 {email} 切换到 {}。", target.label())),
+            Ok(()) => Ok(success_message),
             Err(error) => Ok(format!(
-                "已将 {email} 切换到 {}，但未能自动启动目标程序：{error}",
-                target.label()
+                "{success_message} 但未能自动启动目标程序：{error}"
             )),
         },
     }
@@ -2668,8 +2911,9 @@ fn remove_unified_topic_entry(data: &[u8], target_key: &str) -> Result<Vec<u8>, 
 #[cfg(test)]
 mod tests {
     use super::{
-        backup_db, database_import_outcome, sort_state_db_candidates,
-        user_data_dir_from_command_line, write_file_atomically, DatabaseImportOutcome,
+        backup_db, database_import_outcome, proxy_url_from_windows_proxy_list,
+        sort_state_db_candidates, user_data_dir_from_command_line, write_file_atomically,
+        DatabaseImportOutcome,
     };
     use std::{
         ffi::OsString,
@@ -2729,6 +2973,36 @@ mod tests {
         assert_eq!(
             database_import_outcome(Some("same-token"), "same-token"),
             DatabaseImportOutcome::Unchanged
+        );
+    }
+
+    #[test]
+    fn reads_pac_proxy_directives() {
+        assert_eq!(
+            proxy_url_from_windows_proxy_list(
+                "PROXY 127.0.0.1:10808; DIRECT",
+                "https://oauth2.googleapis.com/token",
+            ),
+            Some("http://127.0.0.1:10808".to_string())
+        );
+    }
+
+    #[test]
+    fn prefers_the_matching_scheme_from_a_manual_proxy_setting() {
+        assert_eq!(
+            proxy_url_from_windows_proxy_list(
+                "http=127.0.0.1:8080;https=127.0.0.1:10808",
+                "https://oauth2.googleapis.com/token",
+            ),
+            Some("http://127.0.0.1:10808".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_direct_only_proxy_results() {
+        assert_eq!(
+            proxy_url_from_windows_proxy_list("DIRECT", "https://oauth2.googleapis.com/token"),
+            None
         );
     }
 
