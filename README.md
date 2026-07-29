@@ -61,7 +61,7 @@ $env:AGY_GOOGLE_OAUTH_CLIENT_SECRET = "你的客户端 Secret"
 npm run tauri dev
 ```
 
-未设置 Client ID 时，OAuth 授权、token 导入、令牌刷新和配额查询会明确提示配置缺失；已添加账号仅能在其短期 access token 尚未过期时切换。账号备份导出、删除等本地文件操作不受影响。不要把真实值写入 `.env.example`、源代码或公开仓库。
+未设置 Client ID 时，OAuth 授权、token 导入、令牌刷新、当前账号自动侦测和配额查询会明确提示配置缺失；已添加账号仅能在其短期 access token 尚未过期时切换。账号备份导出、删除等本地文件操作不受影响。不要把真实值写入 `.env.example`、源代码或公开仓库。桌面 OAuth 使用 PKCE；通常不需要 Client Secret，只有你的 Google 客户端明确要求时才配置它。
 
 构建安装包：
 
@@ -99,13 +99,19 @@ WSL 中编译 Tauri Linux 桌面程序需要本机 GTK/GLib 开发依赖，且�
 
 ## 数据与安全
 
-- refresh token 等同长期账号凭据；`~/.agy-switch/accounts.json` 与旧版备份文件都应按敏感文件保管。
-- Agy Switch 导出的 JSON 备份也包含 refresh token；不要通过聊天、邮件或公共仓库传输。
+- refresh token 等同长期账号凭据；Unix/WSL 上的 `~/.agy-switch` 目录及其中账户文件会强制设为仅当前用户可读写。Windows 账户库使用当前用户的 DPAPI 加密，旧版明文账户库会在首次读取时自动迁移。
+- Agy Switch 导出的 JSON 备份也包含 refresh token；导出前会再次确认，并会在 Unix/WSL 上以仅当前用户可读写的权限创建。不要通过聊天、邮件或公共仓库传输。
+- WSL CLI 切换只会写入 Windows 默认 WSL 发行版中当前 Linux 用户的 `~/.gemini/antigravity-cli/credentials.json`，不会扫描或修改其他发行版及用户目录。
+- Google 网络请求只允许 HTTPS 且不会跟随重定向。在 Windows 上会遵从系统代理；如公司代理实施 TLS 解密，请只在你信任该代理和根证书时进行 OAuth、账号导入或配额刷新。
 - 删除账号只删除 Agy Switch 的本地记录，不会删除 Google 账号、系统凭据或旧项目数据。
 - 首次切换 Antigravity IDE 前，先手动启动一次 IDE，确保已创建 `state.vscdb`。
 - 从数据库导入需要读取已登录程序的 `state.vscdb`；请只选择你信任的本地数据库文件。
 - 切换 Antigravity 或 IDE 时，应用会关闭同一目标的运行进程，防止旧会话把新凭据覆盖回去。
 - 若目标程序关闭超时，切换会取消，避免旧进程与新状态库并发写入。
+
+### 安全处置与审查记录
+
+安全审查的代码修复、已验证范围、平台验证缺口与发布历史处置顺序见 [2026-07-29 安全审查记录](docs/security/2026-07-29-security-review.md)。其中的历史凭据事件必须先在 OAuth 提供方撤销或轮换，再由仓库所有者决定是否协调重写历史；不要仅删除当前源码或未经授权直接强制推送。
 
 ## 验收边界
 

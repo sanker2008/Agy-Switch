@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Core desktop capability for Agy Switch.",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:default", "opener:default"]
+  "permissions": ["core:default", "dialog:default"]
 }

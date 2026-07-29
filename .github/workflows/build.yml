@@ -27,16 +27,16 @@ jobs:
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 20
           cache: 'npm'
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: ${{ matrix.target }}
 
@@ -44,11 +44,9 @@ jobs:
         run: npm ci
 
       - name: Build Tauri app
-        uses: tauri-apps/tauri-action@v1
+        uses: tauri-apps/tauri-action@944946e3e4cac6603d1fe8f514171e9ecd3c78aa # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          AGY_GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.AGY_GOOGLE_OAUTH_CLIENT_ID }}
-          AGY_GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.AGY_GOOGLE_OAUTH_CLIENT_SECRET }}
         with:
           tagName: v__VERSION__
           releaseName: 'Agy Switch v__VERSION__'

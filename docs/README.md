@@ -30,6 +30,8 @@ docs/
 │   └── 2026-07-27-active-client-surface-tracking.md  # 各端作用账号一览规划
 └── changelogs/                                        # 每次发版/功能的具体 Changelog
     └── 2026-07-27-active-client-surface-tracking.md  # 详细变动清单
+└── security/                                          # 安全审查、处置决策与验证边界
+    └── 2026-07-29-security-review.md                 # 当前安全审查记录
 ```
 
 ---
@@ -39,3 +41,4 @@ docs/
 - **只在 `Agy-Switch` 项目内修改代码与创建文档**。
 - `Antigravity-Manager` 项目仅供对比参考，绝不作修改。
 - 本地 `.gemini` 规则维护在 `.git/info/exclude` 中，保持本地私有，不污染 Git 提交。
+- 安全事件记录凭据种类、影响面、处置顺序和验证证据；不得将真实 token、OAuth client secret 或本机路径写入文档。

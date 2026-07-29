@@ -89,7 +89,7 @@ function getTargetDescriptions(lang: Language): Record<string, string> {
     ide: t(lang, "targetIdeDesc"),
     cli: t(lang, "targetCliDesc"),
     win_cli: t(lang, "targetCliDesc"),
-    wsl_cli: "写入 WSL Linux 凭据",
+    wsl_cli: "仅写入默认 WSL 发行版的当前 Linux 用户凭据",
   };
 }
 

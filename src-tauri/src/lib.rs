@@ -2,6 +2,7 @@ use base64::{engine::general_purpose, Engine as _};
 use chrono::{SecondsFormat, Utc};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
@@ -12,6 +13,7 @@ use std::{
 };
 use sysinfo::{ProcessesToUpdate, System};
 use tauri::Emitter;
+use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -27,6 +29,8 @@ const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_REFRESH_SKEW_SECONDS: i64 = 900;
+#[cfg(target_os = "windows")]
+const PROTECTED_STORE_FORMAT: &str = "agy-switch.dpapi.v1";
 const CLOUD_CODE_LOAD_ASSIST_URL: &str =
     "https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist";
 const QUOTA_API_ENDPOINTS: [&str; 3] = [
@@ -41,48 +45,28 @@ const QUOTA_USER_AGENT: &str = "vscode/1.X.X (Antigravity/4.3.0)";
 static STORE_LOCK: Mutex<()> = Mutex::new(());
 static OAUTH_FLOW: OnceLock<Mutex<Option<OAuthFlow>>> = OnceLock::new();
 
-fn default_official_client_id() -> String {
-    let p1 = "1071006060591";
-    let p2 = "tmhssin2h21lcre235vtolojh4g403ep";
-    let p3 = "apps.googleusercontent.com";
-    format!("{p1}-{p2}.{p3}")
-}
-
-fn default_official_client_secret() -> String {
-    String::new()
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct GoogleOAuthClient {
     id: String,
     secret: Option<String>,
 }
 
-fn google_oauth_client() -> Result<GoogleOAuthClient, String> {
-    let id = env::var("AGY_GOOGLE_OAUTH_CLIENT_ID")
-        .ok()
+fn oauth_client_from_values(
+    id: Option<String>,
+    secret: Option<String>,
+) -> Result<GoogleOAuthClient, String> {
+    let id = id
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(default_official_client_id);
-    let secret = env::var("AGY_GOOGLE_OAUTH_CLIENT_SECRET")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| Some(default_official_client_secret()));
+        .ok_or("未配置 Google OAuth 客户端 ID；请设置 AGY_GOOGLE_OAUTH_CLIENT_ID 后重试。")?;
+    let secret = secret.filter(|value| !value.trim().is_empty());
     Ok(GoogleOAuthClient { id, secret })
 }
 
-fn oauth_client_candidates() -> Vec<GoogleOAuthClient> {
-    let mut candidates = Vec::new();
-    if let Ok(client) = google_oauth_client() {
-        candidates.push(client);
-    }
-    let official = GoogleOAuthClient {
-        id: default_official_client_id(),
-        secret: Some(default_official_client_secret()),
-    };
-    if !candidates.iter().any(|c| c.id == official.id) {
-        candidates.push(official);
-    }
-    candidates
+fn google_oauth_client() -> Result<GoogleOAuthClient, String> {
+    oauth_client_from_values(
+        env::var("AGY_GOOGLE_OAUTH_CLIENT_ID").ok(),
+        env::var("AGY_GOOGLE_OAUTH_CLIENT_SECRET").ok(),
+    )
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Hash)]
@@ -146,6 +130,13 @@ struct AccountStore {
     current_target: Option<SwitchTarget>,
     #[serde(default)]
     target_accounts: HashMap<SwitchTarget, String>,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Deserialize, Serialize)]
+struct ProtectedStoreFile {
+    format: String,
+    data: String,
 }
 
 fn default_store_version() -> u8 {
@@ -305,6 +296,7 @@ struct OAuthFlow {
     authorization_url: String,
     redirect_uri: String,
     state: String,
+    code_verifier: String,
     cancel_tx: watch::Sender<bool>,
     code_tx: mpsc::Sender<Result<String, String>>,
     code_rx: Option<mpsc::Receiver<Result<String, String>>>,
@@ -325,7 +317,23 @@ fn now_timestamp() -> i64 {
 fn data_dir() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or("无法定位用户主目录")?;
     let path = home.join(DATA_DIRECTORY);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder
+            .create(&path)
+            .map_err(|error| format!("无法创建 Agy Switch 数据目录：{error}"))?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("无法收紧 Agy Switch 数据目录权限：{error}"))?;
+    }
+
+    #[cfg(not(unix))]
     fs::create_dir_all(&path).map_err(|error| format!("无法创建 Agy Switch 数据目录：{error}"))?;
+
     Ok(path)
 }
 
@@ -348,17 +356,45 @@ fn read_store() -> Result<AccountStore, String> {
             ..AccountStore::default()
         });
     }
-    serde_json::from_slice(&bytes).map_err(|error| format!("账号数据格式损坏：{error}"))
+    let (store, _needs_windows_migration) = decode_store(&bytes)?;
+    #[cfg(target_os = "windows")]
+    if _needs_windows_migration {
+        write_store(&store)?;
+    }
+    Ok(store)
+}
+
+fn decode_store(bytes: &[u8]) -> Result<(AccountStore, bool), String> {
+    #[cfg(target_os = "windows")]
+    if let Ok(protected) = serde_json::from_slice::<ProtectedStoreFile>(bytes) {
+        if protected.format == PROTECTED_STORE_FORMAT {
+            let encrypted = general_purpose::STANDARD
+                .decode(protected.data)
+                .map_err(|error| format!("账号数据加密内容无效：{error}"))?;
+            let plaintext = unprotect_store_data(&encrypted)?;
+            let store = serde_json::from_slice(&plaintext)
+                .map_err(|error| format!("账号数据格式损坏：{error}"))?;
+            return Ok((store, false));
+        }
+    }
+
+    let store =
+        serde_json::from_slice(bytes).map_err(|error| format!("账号数据格式损坏：{error}"))?;
+    Ok((store, true))
 }
 
 fn write_file_atomically(path: &Path, content: &[u8], label: &str) -> Result<(), String> {
     use std::io::Write;
     let temp_path = path.with_extension(format!("tmp-{}", Uuid::new_v4()));
     {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
             .open(&temp_path)
             .map_err(|error| format!("无法写入临时{label}：{error}"))?;
 
@@ -375,7 +411,18 @@ fn write_file_atomically(path: &Path, content: &[u8], label: &str) -> Result<(),
     #[cfg(not(target_os = "windows"))]
     fs::rename(&temp_path, path).map_err(|error| format!("无法保存{label}：{error}"))?;
 
+    #[cfg(unix)]
+    restrict_file_permissions(path, label)?;
+
     Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_file_permissions(path: &Path, label: &str) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("无法收紧{label}文件权限：{error}"))
 }
 
 #[cfg(target_os = "windows")]
@@ -415,11 +462,151 @@ fn replace_file_atomically(temp_path: &Path, path: &Path, label: &str) -> Result
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+#[repr(C)]
+struct DataBlob {
+    cb_data: u32,
+    pb_data: *mut u8,
+}
+
+#[cfg(target_os = "windows")]
+fn protect_store_data(plaintext: &[u8]) -> Result<Vec<u8>, String> {
+    use std::{ffi::c_void, ptr};
+
+    #[link(name = "crypt32")]
+    extern "system" {
+        fn CryptProtectData(
+            data_in: *const DataBlob,
+            description: *const u16,
+            optional_entropy: *const DataBlob,
+            reserved: *mut c_void,
+            prompt_struct: *const c_void,
+            flags: u32,
+            data_out: *mut DataBlob,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(memory: *mut c_void) -> *mut c_void;
+    }
+
+    const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
+    let byte_len = u32::try_from(plaintext.len())
+        .map_err(|_| "账号数据过大，无法使用 Windows 数据保护 API 加密。".to_string())?;
+    let input = DataBlob {
+        cb_data: byte_len,
+        pb_data: plaintext.as_ptr() as *mut u8,
+    };
+    let mut output = DataBlob {
+        cb_data: 0,
+        pb_data: ptr::null_mut(),
+    };
+
+    unsafe {
+        if CryptProtectData(
+            &input,
+            ptr::null(),
+            ptr::null(),
+            ptr::null_mut(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        ) == 0
+        {
+            return Err(format!(
+                "无法使用 Windows 数据保护 API 加密账号数据：{}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let encrypted =
+            std::slice::from_raw_parts(output.pb_data, output.cb_data as usize).to_vec();
+        let _ = LocalFree(output.pb_data.cast());
+        Ok(encrypted)
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn unprotect_store_data(encrypted: &[u8]) -> Result<Vec<u8>, String> {
+    use std::{ffi::c_void, ptr};
+
+    #[link(name = "crypt32")]
+    extern "system" {
+        fn CryptUnprotectData(
+            data_in: *const DataBlob,
+            description: *mut *mut u16,
+            optional_entropy: *const DataBlob,
+            reserved: *mut c_void,
+            prompt_struct: *const c_void,
+            flags: u32,
+            data_out: *mut DataBlob,
+        ) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(memory: *mut c_void) -> *mut c_void;
+    }
+
+    const CRYPTPROTECT_UI_FORBIDDEN: u32 = 0x1;
+    let byte_len = u32::try_from(encrypted.len())
+        .map_err(|_| "账号数据过大，无法使用 Windows 数据保护 API 解密。".to_string())?;
+    let input = DataBlob {
+        cb_data: byte_len,
+        pb_data: encrypted.as_ptr() as *mut u8,
+    };
+    let mut description = ptr::null_mut();
+    let mut output = DataBlob {
+        cb_data: 0,
+        pb_data: ptr::null_mut(),
+    };
+
+    unsafe {
+        if CryptUnprotectData(
+            &input,
+            &mut description,
+            ptr::null(),
+            ptr::null_mut(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &mut output,
+        ) == 0
+        {
+            return Err(format!(
+                "无法使用 Windows 数据保护 API 解密账号数据：{}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let plaintext =
+            std::slice::from_raw_parts(output.pb_data, output.cb_data as usize).to_vec();
+        let _ = LocalFree(output.pb_data.cast());
+        if !description.is_null() {
+            let _ = LocalFree(description.cast());
+        }
+        Ok(plaintext)
+    }
+}
+
 fn write_store(store: &AccountStore) -> Result<(), String> {
     let path = store_path()?;
-    let content =
-        serde_json::to_vec_pretty(store).map_err(|error| format!("无法序列化账号数据：{error}"))?;
+    let content = serialize_store(store)?;
     write_file_atomically(&path, &content, "账号数据")
+}
+
+fn serialize_store(store: &AccountStore) -> Result<Vec<u8>, String> {
+    let plaintext =
+        serde_json::to_vec_pretty(store).map_err(|error| format!("无法序列化账号数据：{error}"))?;
+
+    #[cfg(target_os = "windows")]
+    {
+        let encrypted = protect_store_data(&plaintext)?;
+        return serde_json::to_vec(&ProtectedStoreFile {
+            format: PROTECTED_STORE_FORMAT.to_string(),
+            data: general_purpose::STANDARD.encode(encrypted),
+        })
+        .map_err(|error| format!("无法封装账号数据：{error}"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    Ok(plaintext)
 }
 
 fn account_view(account: &StoredAccount, current_id: Option<&str>) -> AccountView {
@@ -439,52 +626,33 @@ fn token_is_fresh(token: &StoredToken) -> bool {
 }
 
 async fn refresh_token(refresh_token: &str) -> Result<GoogleTokenResponse, String> {
-    let candidates = oauth_client_candidates();
-    let mut last_error = String::new();
+    let oauth_client = google_oauth_client()?;
+    let mut form = vec![
+        ("client_id", oauth_client.id.as_str()),
+        ("refresh_token", refresh_token),
+        ("grant_type", "refresh_token"),
+    ];
+    if let Some(secret) = oauth_client.secret.as_deref() {
+        form.push(("client_secret", secret));
+    }
+    let response = google_http_client(GOOGLE_TOKEN_URL)?
+        .post(GOOGLE_TOKEN_URL)
+        .form(&form)
+        .send()
+        .await
+        .map_err(|error| format!("无法连接 Google 授权服务：{error}"))?;
 
-    for (index, oauth_client) in candidates.iter().enumerate() {
-        let mut form = vec![
-            ("client_id", oauth_client.id.as_str()),
-            ("refresh_token", refresh_token),
-            ("grant_type", "refresh_token"),
-        ];
-        if let Some(secret) = oauth_client.secret.as_deref() {
-            form.push(("client_secret", secret));
-        }
-        let client = google_http_client(GOOGLE_TOKEN_URL)?;
-        let response = client
-            .post(GOOGLE_TOKEN_URL)
-            .form(&form)
-            .send()
+    if response.status().is_success() {
+        return response
+            .json::<GoogleTokenResponse>()
             .await
-            .map_err(|error| format!("无法连接 Google 授权服务：{error}"))?;
-
-        if response.status().is_success() {
-            return response
-                .json::<GoogleTokenResponse>()
-                .await
-                .map_err(|error| format!("Google 授权响应无法解析：{error}"));
-        }
-
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        let error_msg = format!("Refresh token 无效或不可用（HTTP {status}）：{body}");
-
-        if (body.contains("unauthorized_client") || status.as_u16() == 401 || status.as_u16() == 400)
-            && index + 1 < candidates.len()
-        {
-            last_error = error_msg;
-            continue;
-        } else {
-            return Err(error_msg);
-        }
+            .map_err(|error| format!("Google 授权响应无法解析：{error}"));
     }
 
-    Err(if last_error.is_empty() {
-        "未找到有效的 Google OAuth 客户端凭据。".to_string()
-    } else {
-        last_error
-    })
+    Err(format!(
+        "Refresh token 无效或不可用（HTTP {}）。",
+        response.status()
+    ))
 }
 
 async fn fetch_email(access_token: &str) -> Result<String, String> {
@@ -505,6 +673,11 @@ async fn fetch_email(access_token: &str) -> Result<String, String> {
         return Err("Google 未返回账号邮箱，请手动填写。".to_string());
     }
     Ok(info.email)
+}
+
+async fn email_from_refresh_token(refresh_token_value: &str) -> Result<String, String> {
+    let token = refresh_token(refresh_token_value).await?;
+    fetch_email(&token.access_token).await
 }
 
 async fn build_account(
@@ -553,7 +726,21 @@ fn oauth_flow_state() -> &'static Mutex<Option<OAuthFlow>> {
     OAUTH_FLOW.get_or_init(|| Mutex::new(None))
 }
 
-fn build_oauth_authorization_url(redirect_uri: &str, state: &str) -> Result<String, String> {
+fn new_pkce_verifier() -> String {
+    (0..4)
+        .map(|_| Uuid::new_v4().simple().to_string())
+        .collect()
+}
+
+fn pkce_challenge(code_verifier: &str) -> String {
+    general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(code_verifier.as_bytes()))
+}
+
+fn build_oauth_authorization_url(
+    redirect_uri: &str,
+    state: &str,
+    code_challenge: &str,
+) -> Result<String, String> {
     let oauth_client = google_oauth_client()?;
     let scopes = [
         "openid",
@@ -575,6 +762,8 @@ fn build_oauth_authorization_url(redirect_uri: &str, state: &str) -> Result<Stri
             ("prompt", "consent"),
             ("include_granted_scopes", "true"),
             ("state", state),
+            ("code_challenge", code_challenge),
+            ("code_challenge_method", "S256"),
         ],
     )
     .map(|url| url.to_string())
@@ -616,7 +805,9 @@ async fn prepare_oauth_flow(app: tauri::AppHandle) -> Result<String, String> {
         .port();
     let redirect_uri = format!("http://127.0.0.1:{port}/oauth-callback");
     let state = Uuid::new_v4().to_string();
-    let authorization_url = build_oauth_authorization_url(&redirect_uri, &state)?;
+    let code_verifier = new_pkce_verifier();
+    let authorization_url =
+        build_oauth_authorization_url(&redirect_uri, &state, &pkce_challenge(&code_verifier))?;
     let (cancel_tx, mut cancel_rx) = watch::channel(false);
     let (code_tx, code_rx) = mpsc::channel::<Result<String, String>>(1);
     let callback_tx = code_tx.clone();
@@ -679,6 +870,7 @@ async fn prepare_oauth_flow(app: tauri::AppHandle) -> Result<String, String> {
         authorization_url: authorization_url.clone(),
         redirect_uri,
         state,
+        code_verifier,
         cancel_tx,
         code_tx,
         code_rx: Some(code_rx),
@@ -697,12 +889,14 @@ fn cancel_oauth_flow() {
 async fn exchange_oauth_code(
     code: &str,
     redirect_uri: &str,
+    code_verifier: &str,
 ) -> Result<GoogleTokenResponse, String> {
     let oauth_client = google_oauth_client()?;
     let mut form = vec![
         ("client_id", oauth_client.id.as_str()),
         ("code", code),
         ("redirect_uri", redirect_uri),
+        ("code_verifier", code_verifier),
         ("grant_type", "authorization_code"),
     ];
     if let Some(secret) = oauth_client.secret.as_deref() {
@@ -861,7 +1055,7 @@ fn proxy_url_from_windows_proxy_list(proxy_list: &str, request_url: &str) -> Opt
         };
         if Url::parse(&url)
             .ok()
-            .filter(|url| url.host_str().is_some())
+            .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
             .is_some()
         {
             if protocol.as_deref() == Some(request_scheme.as_str()) {
@@ -1026,14 +1220,15 @@ fn windows_system_proxy_for_url(request_url: &str) -> Option<String> {
         if proxy_lookup_succeeded {
             resolved
         } else {
-            static_proxy
-                .and_then(|proxy| proxy_url_from_windows_proxy_list(&proxy, request_url))
+            static_proxy.and_then(|proxy| proxy_url_from_windows_proxy_list(&proxy, request_url))
         }
     }
 }
 
 fn google_http_client(request_url: &str) -> Result<reqwest::Client, String> {
     let builder = reqwest::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20));
 
@@ -1261,7 +1456,7 @@ async fn open_oauth_browser(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 async fn complete_oauth_login() -> Result<AccountView, String> {
-    let (mut code_rx, redirect_uri) = {
+    let (mut code_rx, redirect_uri, code_verifier) = {
         let mut state = oauth_flow_state()
             .lock()
             .map_err(|_| "OAuth 状态锁不可用")?;
@@ -1272,7 +1467,11 @@ async fn complete_oauth_login() -> Result<AccountView, String> {
             .code_rx
             .take()
             .ok_or("OAuth 授权正在处理中，请勿重复提交。")?;
-        (code_rx, flow.redirect_uri.clone())
+        (
+            code_rx,
+            flow.redirect_uri.clone(),
+            flow.code_verifier.clone(),
+        )
     };
     let code = match code_rx.recv().await {
         Some(Ok(code)) => code,
@@ -1280,8 +1479,10 @@ async fn complete_oauth_login() -> Result<AccountView, String> {
         None => return Err("OAuth 授权已取消或回调端口已关闭。".to_string()),
     };
     cancel_oauth_flow();
-    let account =
-        build_account_from_oauth_token(exchange_oauth_code(&code, &redirect_uri).await?).await?;
+    let account = build_account_from_oauth_token(
+        exchange_oauth_code(&code, &redirect_uri, &code_verifier).await?,
+    )
+    .await?;
     upsert_imported_account(add_quota_if_available(account).await)
 }
 
@@ -1334,7 +1535,10 @@ fn cancel_oauth_login() {
 async fn import_default_database(
     target: Option<SwitchTarget>,
 ) -> Result<DatabaseImportResult, String> {
-    if target == Some(SwitchTarget::Cli) || target == Some(SwitchTarget::WinCli) || target == Some(SwitchTarget::WslCli) {
+    if target == Some(SwitchTarget::Cli)
+        || target == Some(SwitchTarget::WinCli)
+        || target == Some(SwitchTarget::WslCli)
+    {
         return import_account_from_keyring().await;
     }
 
@@ -1615,7 +1819,6 @@ async fn import_v1_accounts() -> Result<ImportResult, String> {
     store_imported_accounts(prepared)
 }
 
-#[tauri::command]
 fn export_accounts() -> Result<BackupFile, String> {
     let _guard = STORE_LOCK.lock().map_err(|_| "账号存储锁不可用")?;
     let store = read_store()?;
@@ -1634,11 +1837,25 @@ fn export_accounts() -> Result<BackupFile, String> {
 }
 
 #[tauri::command]
-fn export_accounts_to_file(path: String) -> Result<String, String> {
+async fn export_accounts_to_file(app: tauri::AppHandle, path: String) -> Result<String, String> {
     let path = PathBuf::from(path.trim());
     if path.as_os_str().is_empty() {
         return Err("请选择账号备份保存位置。".to_string());
     }
+
+    let confirmed = tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .message("导出的 JSON 包含长期 refresh token。请仅保存到受信任的私有位置，且不要通过聊天、邮件或公共仓库传输。是否继续？")
+            .title("确认导出账号备份")
+            .buttons(tauri_plugin_dialog::MessageDialogButtons::YesNo)
+            .blocking_show()
+    })
+    .await
+    .map_err(|error| format!("无法显示账号备份确认对话框：{error}"))?;
+    if !confirmed {
+        return Err("已取消账号备份导出。".to_string());
+    }
+
     let backup = export_accounts()?;
     let content = serde_json::to_vec_pretty(&backup)
         .map_err(|error| format!("无法序列化账号备份：{error}"))?;
@@ -1729,9 +1946,7 @@ fn switch_account(account_id: String, target: SwitchTarget) -> Result<String, St
         SwitchTarget::Cli | SwitchTarget::WinCli | SwitchTarget::WslCli => Ok(success_message),
         SwitchTarget::Desktop | SwitchTarget::Ide => match start_target(target) {
             Ok(()) => Ok(success_message),
-            Err(error) => Ok(format!(
-                "{success_message} 但未能自动启动目标程序：{error}"
-            )),
+            Err(error) => Ok(format!("{success_message} 但未能自动启动目标程序：{error}")),
         },
     }
 }
@@ -1778,8 +1993,35 @@ fn backup_db(db_path: &Path) -> Result<PathBuf, String> {
         "vscdb.agy-switch-{stamp}-{}.backup",
         Uuid::new_v4()
     ));
-    fs::copy(db_path, &backup).map_err(|error| format!("无法备份目标状态库：{error}"))?;
+    copy_database_backup(db_path, &backup)?;
     Ok(backup)
+}
+
+fn copy_database_backup(source: &Path, destination: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let mut input = fs::File::open(source)
+            .map_err(|error| format!("无法读取目标状态库以创建备份：{error}"))?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        let mut output = options
+            .open(destination)
+            .map_err(|error| format!("无法创建受保护的状态库备份：{error}"))?;
+        std::io::copy(&mut input, &mut output)
+            .map_err(|error| format!("无法备份目标状态库：{error}"))?;
+        output
+            .sync_all()
+            .map_err(|error| format!("无法同步状态库备份：{error}"))?;
+        restrict_file_permissions(destination, "状态库备份")
+    }
+
+    #[cfg(not(unix))]
+    {
+        fs::copy(source, destination).map_err(|error| format!("无法备份目标状态库：{error}"))?;
+        Ok(())
+    }
 }
 
 fn restore_db(backup_path: &Path, db_path: &Path) -> Result<(), String> {
@@ -1811,10 +2053,16 @@ fn close_running_target(target: SwitchTarget) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         if target == SwitchTarget::Desktop {
-            let _ = Command::new("taskkill").args(["/F", "/T", "/IM", "antigravity.exe"]).output();
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/IM", "antigravity.exe"])
+                .output();
         } else if target == SwitchTarget::Ide {
-            let _ = Command::new("taskkill").args(["/F", "/T", "/IM", "Antigravity IDE.exe"]).output();
-            let _ = Command::new("taskkill").args(["/F", "/T", "/IM", "antigravity-ide.exe"]).output();
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/IM", "Antigravity IDE.exe"])
+                .output();
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/IM", "antigravity-ide.exe"])
+                .output();
         }
     }
 
@@ -1858,14 +2106,22 @@ fn state_db_path_in(user_data_dir: PathBuf) -> PathBuf {
 fn target_matches_process_name(target: SwitchTarget, name: &str) -> bool {
     let name = name.to_ascii_lowercase();
     let is_ide = name.contains("antigravity ide") || name.contains("antigravity-ide");
-    let is_self_or_helper = name.contains("agy-switch") || name.contains("agy_switch") || name.contains("antigravity-cli") || name.contains("antigravity-manager") || name.contains("antigravity-proxy");
-    
+    let is_self_or_helper = name.contains("agy-switch")
+        || name.contains("agy_switch")
+        || name.contains("antigravity-cli")
+        || name.contains("antigravity-manager")
+        || name.contains("antigravity-proxy");
+
     if is_self_or_helper {
         return false;
     }
 
     match target {
-        SwitchTarget::Desktop => name == "antigravity.exe" || name == "antigravity" || (name.contains("antigravity") && !is_ide),
+        SwitchTarget::Desktop => {
+            name == "antigravity.exe"
+                || name == "antigravity"
+                || (name.contains("antigravity") && !is_ide)
+        }
         SwitchTarget::Ide => is_ide,
         SwitchTarget::Cli | SwitchTarget::WinCli | SwitchTarget::WslCli => false,
     }
@@ -2199,57 +2455,59 @@ fn executable_path(target: SwitchTarget) -> Option<PathBuf> {
     candidates.into_iter().find(|path| path.is_file())
 }
 
+#[cfg(any(target_os = "windows", test))]
+const WSL_CREDENTIAL_WRITE_COMMAND: &str = "umask 077; mkdir -p \"$HOME/.gemini/antigravity-cli\"; cat > \"$HOME/.gemini/antigravity-cli/credentials.json\"; chmod 600 \"$HOME/.gemini/antigravity-cli/credentials.json\"";
+#[cfg(any(target_os = "windows", test))]
+const WSL_CREDENTIAL_READ_COMMAND: &str = "if [ -r \"$HOME/.gemini/antigravity-cli/credentials.json\" ]; then cat \"$HOME/.gemini/antigravity-cli/credentials.json\"; else secret-tool lookup service gemini username antigravity; fi";
+
 fn write_to_wsl_cli(account: &StoredAccount) -> Result<(), String> {
-    let _ = write_to_system_keyring(account);
+    #[cfg(target_os = "windows")]
+    {
+        use std::io::Write;
 
-    let expiry = chrono::DateTime::from_timestamp(account.token.expires_at, 0)
-        .unwrap_or_else(Utc::now)
-        .to_rfc3339_opts(SecondsFormat::Micros, true);
+        let expiry = chrono::DateTime::from_timestamp(account.token.expires_at, 0)
+            .unwrap_or_else(Utc::now)
+            .to_rfc3339_opts(SecondsFormat::Micros, true);
+        let payload = serde_json::to_string_pretty(&serde_json::json!({
+            "token": {
+                "access_token": account.token.access_token,
+                "token_type": "Bearer",
+                "refresh_token": account.token.refresh_token,
+                "expiry": expiry
+            },
+            "auth_method": "consumer"
+        }))
+        .map_err(|error| format!("无法序列化 WSL 凭据：{error}"))?;
 
-    let payload = serde_json::to_string_pretty(&serde_json::json!({
-        "token": {
-            "access_token": account.token.access_token,
-            "token_type": "Bearer",
-            "refresh_token": account.token.refresh_token,
-            "expiry": expiry
-        },
-        "auth_method": "consumer"
-    })).map_err(|e| format!("无法序列化 WSL 凭据：{}", e))?;
-
-    let mut written = false;
-    let wsl_prefixes = ["\\\\wsl.localhost", "\\\\wsl$"];
-
-    for prefix in &wsl_prefixes {
-        let base_path = Path::new(prefix);
-        if base_path.exists() {
-            if let Ok(entries) = fs::read_dir(base_path) {
-                for entry in entries.flatten() {
-                    let home_dir = entry.path().join("home");
-                    if home_dir.exists() {
-                        if let Ok(users) = fs::read_dir(&home_dir) {
-                            for user in users.flatten() {
-                                let cli_dir = user.path().join(".gemini").join("antigravity-cli");
-                                if fs::create_dir_all(&cli_dir).is_ok() {
-                                    let cred_path = cli_dir.join("credentials.json");
-                                    if fs::write(&cred_path, &payload).is_ok() {
-                                        written = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+        let mut child = Command::new("wsl.exe")
+            .args(["--", "sh", "-c", WSL_CREDENTIAL_WRITE_COMMAND])
+            .stdin(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|error| format!("无法启动默认 WSL 发行版：{error}"))?;
+        child
+            .stdin
+            .take()
+            .ok_or("无法写入默认 WSL 发行版的凭据。")?
+            .write_all(payload.as_bytes())
+            .map_err(|error| format!("无法写入默认 WSL 发行版的凭据：{error}"))?;
+        let output = child
+            .wait_with_output()
+            .map_err(|error| format!("无法等待 WSL 凭据写入完成：{error}"))?;
+        if output.status.success() {
+            return Ok(());
         }
+        return Err(format!(
+            "默认 WSL 发行版的凭据写入失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
     }
 
-    if !written {
-        let _ = Command::new("wsl")
-            .args(["--", "sh", "-c", &format!("mkdir -p ~/.gemini/antigravity-cli && echo '{}' > ~/.gemini/antigravity-cli/credentials.json", payload.replace('\'', "'\\''"))])
-            .output();
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = account;
+        Err("WSL CLI 切换只能在 Windows 上执行。".to_string())
     }
-
-    Ok(())
 }
 
 fn write_to_system_keyring(account: &StoredAccount) -> Result<(), String> {
@@ -2416,7 +2674,10 @@ fn write_windows_credential(payload: &str) -> Result<(), String> {
 async fn import_account_from_keyring() -> Result<DatabaseImportResult, String> {
     let raw_payloads = read_all_system_keyrings();
     if raw_payloads.is_empty() {
-        return Err("系统凭据管理器或 WSL 中未找到 Antigravity CLI 登录凭据（gemini:antigravity）。".to_string());
+        return Err(
+            "系统凭据管理器或 WSL 中未找到 Antigravity CLI 登录凭据（gemini:antigravity）。"
+                .to_string(),
+        );
     }
 
     let mut last_result = None;
@@ -2424,17 +2685,17 @@ async fn import_account_from_keyring() -> Result<DatabaseImportResult, String> {
 
     for raw_payload in raw_payloads {
         match extract_refresh_token_from_keyring(&raw_payload) {
-            Ok(refresh_token) => {
-                match build_account(String::new(), refresh_token).await {
-                    Ok(account) => {
-                        match upsert_imported_account_with_outcome(add_quota_if_available(account).await) {
-                            Ok(outcome) => last_result = Some(outcome),
-                            Err(err) => errors.push(err),
-                        }
+            Ok(refresh_token) => match build_account(String::new(), refresh_token).await {
+                Ok(account) => {
+                    match upsert_imported_account_with_outcome(
+                        add_quota_if_available(account).await,
+                    ) {
+                        Ok(outcome) => last_result = Some(outcome),
+                        Err(err) => errors.push(err),
                     }
-                    Err(err) => errors.push(err),
                 }
-            }
+                Err(err) => errors.push(err),
+            },
             Err(err) => errors.push(err),
         }
     }
@@ -2442,7 +2703,10 @@ async fn import_account_from_keyring() -> Result<DatabaseImportResult, String> {
     if let Some(res) = last_result {
         Ok(res)
     } else {
-        Err(errors.into_iter().next().unwrap_or_else(|| "未能从 Antigravity CLI 导入账号。".to_string()))
+        Err(errors
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "未能从 Antigravity CLI 导入账号。".to_string()))
     }
 }
 
@@ -2587,8 +2851,10 @@ fn read_windows_credential() -> Result<String, String> {
     unsafe {
         if CredReadW(target.as_ptr(), 1, 0, &mut cred_ptr) != 0 && !cred_ptr.is_null() {
             let cred = &*cred_ptr;
-            let blob_slice =
-                std::slice::from_raw_parts(cred.credential_blob, cred.credential_blob_size as usize);
+            let blob_slice = std::slice::from_raw_parts(
+                cred.credential_blob,
+                cred.credential_blob_size as usize,
+            );
             let payload = String::from_utf8_lossy(blob_slice).to_string();
             CredFree(cred_ptr as *mut c_void);
             if !payload.trim().is_empty() {
@@ -2601,34 +2867,8 @@ fn read_windows_credential() -> Result<String, String> {
 
 #[cfg(target_os = "windows")]
 fn read_wsl_credential() -> Result<String, String> {
-    let wsl_prefixes = ["\\\\wsl.localhost", "\\\\wsl$"];
-    for prefix in &wsl_prefixes {
-        let base_path = Path::new(prefix);
-        if base_path.exists() {
-            if let Ok(entries) = fs::read_dir(base_path) {
-                for entry in entries.flatten() {
-                    let home_dir = entry.path().join("home");
-                    if home_dir.exists() {
-                        if let Ok(users) = fs::read_dir(&home_dir) {
-                            for user in users.flatten() {
-                                let cred_path = user.path().join(".gemini").join("antigravity-cli").join("credentials.json");
-                                if cred_path.is_file() {
-                                    if let Ok(content) = fs::read_to_string(&cred_path) {
-                                        if !content.trim().is_empty() {
-                                            return Ok(content);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     let output = Command::new("wsl.exe")
-        .args(["secret-tool", "lookup", "service", "gemini", "username", "antigravity"])
+        .args(["--", "sh", "-c", WSL_CREDENTIAL_READ_COMMAND])
         .output()
         .map_err(|e| format!("WSL 无法执行 secret-tool：{e}"))?;
     if output.status.success() {
@@ -2646,12 +2886,19 @@ async fn detect_system_active_accounts(store: &AccountStore) -> HashMap<SwitchTa
     // 1. Detect Desktop active account
     for db_path in import_state_db_candidates(Some(SwitchTarget::Desktop)) {
         if let Ok(db_token) = extract_database_token(&db_path) {
-            if let Some(account) = store.accounts.iter().find(|a| a.token.refresh_token == db_token.refresh_token || a.token.access_token == db_token.refresh_token) {
+            if let Some(account) = store.accounts.iter().find(|a| {
+                a.token.refresh_token == db_token.refresh_token
+                    || a.token.access_token == db_token.refresh_token
+            }) {
                 detected.insert(SwitchTarget::Desktop, account.email.clone());
                 break;
             }
-            if let Ok(email) = fetch_email(&db_token.refresh_token).await {
-                if let Some(account) = store.accounts.iter().find(|a| a.email.eq_ignore_ascii_case(&email)) {
+            if let Ok(email) = email_from_refresh_token(&db_token.refresh_token).await {
+                if let Some(account) = store
+                    .accounts
+                    .iter()
+                    .find(|a| a.email.eq_ignore_ascii_case(&email))
+                {
                     detected.insert(SwitchTarget::Desktop, account.email.clone());
                     break;
                 }
@@ -2662,12 +2909,19 @@ async fn detect_system_active_accounts(store: &AccountStore) -> HashMap<SwitchTa
     // 2. Detect IDE active account
     for db_path in import_state_db_candidates(Some(SwitchTarget::Ide)) {
         if let Ok(db_token) = extract_database_token(&db_path) {
-            if let Some(account) = store.accounts.iter().find(|a| a.token.refresh_token == db_token.refresh_token || a.token.access_token == db_token.refresh_token) {
+            if let Some(account) = store.accounts.iter().find(|a| {
+                a.token.refresh_token == db_token.refresh_token
+                    || a.token.access_token == db_token.refresh_token
+            }) {
                 detected.insert(SwitchTarget::Ide, account.email.clone());
                 break;
             }
-            if let Ok(email) = fetch_email(&db_token.refresh_token).await {
-                if let Some(account) = store.accounts.iter().find(|a| a.email.eq_ignore_ascii_case(&email)) {
+            if let Ok(email) = email_from_refresh_token(&db_token.refresh_token).await {
+                if let Some(account) = store
+                    .accounts
+                    .iter()
+                    .find(|a| a.email.eq_ignore_ascii_case(&email))
+                {
                     detected.insert(SwitchTarget::Ide, account.email.clone());
                     break;
                 }
@@ -2680,11 +2934,19 @@ async fn detect_system_active_accounts(store: &AccountStore) -> HashMap<SwitchTa
     {
         if let Ok(raw_cred) = read_windows_credential() {
             if let Ok(rt) = extract_refresh_token_from_keyring(&raw_cred) {
-                if let Some(account) = store.accounts.iter().find(|a| a.token.refresh_token == rt || a.token.access_token == rt) {
+                if let Some(account) = store
+                    .accounts
+                    .iter()
+                    .find(|a| a.token.refresh_token == rt || a.token.access_token == rt)
+                {
                     detected.insert(SwitchTarget::WinCli, account.email.clone());
                     detected.insert(SwitchTarget::Cli, account.email.clone());
-                } else if let Ok(email) = fetch_email(&rt).await {
-                    if let Some(account) = store.accounts.iter().find(|a| a.email.eq_ignore_ascii_case(&email)) {
+                } else if let Ok(email) = email_from_refresh_token(&rt).await {
+                    if let Some(account) = store
+                        .accounts
+                        .iter()
+                        .find(|a| a.email.eq_ignore_ascii_case(&email))
+                    {
                         detected.insert(SwitchTarget::WinCli, account.email.clone());
                         detected.insert(SwitchTarget::Cli, account.email.clone());
                     }
@@ -2698,10 +2960,18 @@ async fn detect_system_active_accounts(store: &AccountStore) -> HashMap<SwitchTa
     {
         if let Ok(raw_cred) = read_wsl_credential() {
             if let Ok(rt) = extract_refresh_token_from_keyring(&raw_cred) {
-                if let Some(account) = store.accounts.iter().find(|a| a.token.refresh_token == rt || a.token.access_token == rt) {
+                if let Some(account) = store
+                    .accounts
+                    .iter()
+                    .find(|a| a.token.refresh_token == rt || a.token.access_token == rt)
+                {
                     detected.insert(SwitchTarget::WslCli, account.email.clone());
-                } else if let Ok(email) = fetch_email(&rt).await {
-                    if let Some(account) = store.accounts.iter().find(|a| a.email.eq_ignore_ascii_case(&email)) {
+                } else if let Ok(email) = email_from_refresh_token(&rt).await {
+                    if let Some(account) = store
+                        .accounts
+                        .iter()
+                        .find(|a| a.email.eq_ignore_ascii_case(&email))
+                    {
                         detected.insert(SwitchTarget::WslCli, account.email.clone());
                     }
                 }
@@ -2911,9 +3181,10 @@ fn remove_unified_topic_entry(data: &[u8], target_key: &str) -> Result<Vec<u8>, 
 #[cfg(test)]
 mod tests {
     use super::{
-        backup_db, database_import_outcome, proxy_url_from_windows_proxy_list,
-        sort_state_db_candidates, user_data_dir_from_command_line, write_file_atomically,
-        DatabaseImportOutcome,
+        backup_db, database_import_outcome, is_oauth_config_key, oauth_client_from_values,
+        pkce_challenge, proxy_url_from_windows_proxy_list, sort_state_db_candidates,
+        user_data_dir_from_command_line, write_file_atomically, DatabaseImportOutcome,
+        WSL_CREDENTIAL_READ_COMMAND, WSL_CREDENTIAL_WRITE_COMMAND,
     };
     use std::{
         ffi::OsString,
@@ -3007,6 +3278,44 @@ mod tests {
     }
 
     #[test]
+    fn pkce_challenge_uses_the_rfc_7636_s256_encoding() {
+        assert_eq!(
+            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn oauth_requires_an_explicit_client_id_and_keeps_secret_optional() {
+        assert!(oauth_client_from_values(None, None).is_err());
+
+        let client = oauth_client_from_values(Some("desktop-client-id".to_string()), None)
+            .expect("an installed-app client id should be sufficient for PKCE");
+        assert_eq!(client.id, "desktop-client-id");
+        assert_eq!(client.secret, None);
+    }
+
+    #[test]
+    fn dotenv_loader_only_accepts_the_documented_oauth_keys() {
+        assert!(is_oauth_config_key("AGY_GOOGLE_OAUTH_CLIENT_ID"));
+        assert!(is_oauth_config_key("AGY_GOOGLE_OAUTH_CLIENT_SECRET"));
+        assert!(!is_oauth_config_key("PATH"));
+        assert!(!is_oauth_config_key("RUST_LOG"));
+    }
+
+    #[test]
+    fn wsl_credential_commands_are_scoped_to_the_default_linux_user() {
+        for command in [WSL_CREDENTIAL_WRITE_COMMAND, WSL_CREDENTIAL_READ_COMMAND] {
+            assert!(command.contains("$HOME/.gemini/antigravity-cli/credentials.json"));
+            assert!(!command.contains("wsl.localhost"));
+            assert!(!command.contains("wsl$"));
+            assert!(!command.contains("/home/*"));
+        }
+        assert!(WSL_CREDENTIAL_WRITE_COMMAND.contains("umask 077"));
+        assert!(WSL_CREDENTIAL_WRITE_COMMAND.contains("chmod 600"));
+    }
+
+    #[test]
     fn newest_state_database_is_preferred_when_no_instance_is_running() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -3051,6 +3360,19 @@ mod tests {
             fs::read(&path).expect("replacement should be readable"),
             b"new"
         );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path)
+                    .expect("replacement metadata should be readable")
+                    .permissions()
+                    .mode()
+                    & 0o077,
+                0,
+                "credential-bearing files must not be group or world readable"
+            );
+        }
         let _ = fs::remove_dir_all(&directory);
     }
 
@@ -3072,8 +3394,31 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.is_file());
         assert!(second.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            for backup in [&first, &second] {
+                assert_eq!(
+                    fs::metadata(backup)
+                        .expect("backup metadata should be readable")
+                        .permissions()
+                        .mode()
+                        & 0o077,
+                    0,
+                    "state database backups must be private at creation"
+                );
+            }
+        }
         let _ = fs::remove_dir_all(&directory);
     }
+}
+
+fn is_oauth_config_key(key: &str) -> bool {
+    matches!(
+        key,
+        "AGY_GOOGLE_OAUTH_CLIENT_ID" | "AGY_GOOGLE_OAUTH_CLIENT_SECRET"
+    )
 }
 
 fn load_env_file() {
@@ -3093,7 +3438,7 @@ fn load_env_file() {
                 if let Some((key, value)) = line.split_once('=') {
                     let key = key.trim();
                     let value = value.trim().trim_matches('"').trim_matches('\'');
-                    if !key.is_empty() && env::var(key).is_err() {
+                    if is_oauth_config_key(key) && env::var(key).is_err() {
                         env::set_var(key, value);
                     }
                 }
@@ -3121,7 +3466,6 @@ pub fn run() {
             add_account,
             import_accounts,
             import_v1_accounts,
-            export_accounts,
             export_accounts_to_file,
             import_backup_file,
             delete_account,
