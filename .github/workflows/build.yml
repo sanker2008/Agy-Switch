@@ -43,10 +43,21 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Validate packaged OAuth client ID
+        shell: bash
+        env:
+          AGY_BUNDLED_GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.AGY_GOOGLE_OAUTH_CLIENT_ID }}
+        run: |
+          if [[ -z "${AGY_BUNDLED_GOOGLE_OAUTH_CLIENT_ID//[[:space:]]/}" ]]; then
+            echo "::error::Missing AGY_GOOGLE_OAUTH_CLIENT_ID. Refusing to build an installer without its bundled OAuth client ID."
+            exit 1
+          fi
+
       - name: Build Tauri app
         uses: tauri-apps/tauri-action@944946e3e4cac6603d1fe8f514171e9ecd3c78aa # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AGY_BUNDLED_GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.AGY_GOOGLE_OAUTH_CLIENT_ID }}
         with:
           tagName: v__VERSION__
           releaseName: 'Agy Switch v__VERSION__'

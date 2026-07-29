@@ -29,6 +29,10 @@ const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_REFRESH_SKEW_SECONDS: i64 = 900;
+// Set only by the release build environment. A Google OAuth desktop client ID is public
+// metadata; a client secret must never be embedded in a desktop application.
+const BUNDLED_GOOGLE_OAUTH_CLIENT_ID: Option<&str> =
+    option_env!("AGY_BUNDLED_GOOGLE_OAUTH_CLIENT_ID");
 #[cfg(target_os = "windows")]
 const PROTECTED_STORE_FORMAT: &str = "agy-switch.dpapi.v1";
 const CLOUD_CODE_LOAD_ASSIST_URL: &str =
@@ -52,19 +56,34 @@ struct GoogleOAuthClient {
 }
 
 fn oauth_client_from_values(
-    id: Option<String>,
+    runtime_id: Option<String>,
+    bundled_id: Option<&str>,
     secret: Option<String>,
 ) -> Result<GoogleOAuthClient, String> {
-    let id = id
-        .filter(|value| !value.trim().is_empty())
+    let id = runtime_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            bundled_id
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
         .ok_or("未配置 Google OAuth 客户端 ID；请设置 AGY_GOOGLE_OAUTH_CLIENT_ID 后重试。")?;
-    let secret = secret.filter(|value| !value.trim().is_empty());
+    let secret = secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
     Ok(GoogleOAuthClient { id, secret })
 }
 
 fn google_oauth_client() -> Result<GoogleOAuthClient, String> {
     oauth_client_from_values(
         env::var("AGY_GOOGLE_OAUTH_CLIENT_ID").ok(),
+        BUNDLED_GOOGLE_OAUTH_CLIENT_ID,
         env::var("AGY_GOOGLE_OAUTH_CLIENT_SECRET").ok(),
     )
 }
@@ -3286,13 +3305,34 @@ mod tests {
     }
 
     #[test]
-    fn oauth_requires_an_explicit_client_id_and_keeps_secret_optional() {
-        assert!(oauth_client_from_values(None, None).is_err());
+    fn oauth_prefers_runtime_client_id_then_uses_bundled_id() {
+        assert!(oauth_client_from_values(None, None, None).is_err());
 
-        let client = oauth_client_from_values(Some("desktop-client-id".to_string()), None)
-            .expect("an installed-app client id should be sufficient for PKCE");
-        assert_eq!(client.id, "desktop-client-id");
-        assert_eq!(client.secret, None);
+        let bundled = oauth_client_from_values(None, Some("bundled-client-id"), None)
+            .expect("a bundled installed-app client id should be sufficient for PKCE");
+        assert_eq!(bundled.id, "bundled-client-id");
+        assert_eq!(bundled.secret, None);
+
+        let runtime = oauth_client_from_values(
+            Some("runtime-client-id".to_string()),
+            Some("bundled-client-id"),
+            None,
+        )
+        .expect("a runtime client id should override the bundled client id");
+        assert_eq!(runtime.id, "runtime-client-id");
+        assert_eq!(runtime.secret, None);
+
+        let custom_secret = oauth_client_from_values(
+            Some("custom-client-id".to_string()),
+            None,
+            Some("custom-client-secret".to_string()),
+        )
+        .expect("a custom runtime client may still provide an optional secret");
+        assert_eq!(custom_secret.id, "custom-client-id");
+        assert_eq!(
+            custom_secret.secret.as_deref(),
+            Some("custom-client-secret")
+        );
     }
 
     #[test]

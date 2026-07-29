@@ -25,7 +25,7 @@
 
 ## 使用方式
 
-1. 配置 Google OAuth 后，点击“添加账号”，默认选择 **OAuth 授权**。点击“开始 OAuth 授权”后，浏览器会打开 Google 登录页；授权完成后返回应用点击“我已授权，继续”。
+1. 官方发布的安装包已包含构建期注入的 Google OAuth Client ID，无需额外配置。点击“添加账号”，默认选择 **OAuth 授权**。点击“开始 OAuth 授权”后，浏览器会打开 Google 登录页；授权完成后返回应用点击“我已授权，继续”。
 2. 如已有 token，切换至 **Refresh Token**，可粘贴单个 token、含 `refresh_token` 的 JSON 数组，或任意包含多个 token 的文本。
 3. 如目标程序已经登录，切换至 **从数据库导入**，点击 **自动导入当前登录账号** 会优先读取正在运行的实例；未运行时会选择最近更新的 Antigravity 或 Antigravity IDE 状态库。也可指定 Antigravity、Antigravity IDE，或手动选择 `state.vscdb`；还可扫描 `~/.antigravity-agent` 批量导入 V1 备份。
 4. 选中账号后，直接点击 Antigravity、Antigravity IDE 或 Antigravity CLI 即可切换；界面会显示上次成功切换的目标。
@@ -52,22 +52,28 @@ npm run tauri dev
 
 ### Google OAuth 配置
 
-为避免将 OAuth 客户端凭据硬编码进公开仓库，OAuth 登录和 refresh token 刷新从运行环境读取配置。复制 `.env.example` 的变量名，在启动应用的同一个终端中设置自己的桌面端 OAuth 客户端：
+官方发布包在 CI 构建期将公开的 Google OAuth **Client ID** 写入安装包；普通用户下载安装后不需要设置环境变量，即可完成 OAuth 登录、授权码换 token、refresh token 刷新、账号验证和模型配额查询。Client ID 是公开标识，不是 Client Secret。
+
+运行期的 `AGY_GOOGLE_OAUTH_CLIENT_ID` 优先级更高，可用于开发、测试或企业自有 OAuth 客户端覆盖。复制 `.env.example` 的变量名，在启动应用的同一个终端中设置：
 
 ```powershell
 $env:AGY_GOOGLE_OAUTH_CLIENT_ID = "你的客户端 ID"
-# 仅当该客户端在 Google 配置中包含 secret 时才需要：
+# 仅当自有客户端明确要求时才在本机进程中设置；官方安装包不包含它：
 $env:AGY_GOOGLE_OAUTH_CLIENT_SECRET = "你的客户端 Secret"
 npm run tauri dev
 ```
 
-未设置 Client ID 时，OAuth 授权、token 导入、令牌刷新、当前账号自动侦测和配额查询会明确提示配置缺失；已添加账号仅能在其短期 access token 尚未过期时切换。账号备份导出、删除等本地文件操作不受影响。不要把真实值写入 `.env.example`、源代码或公开仓库。桌面 OAuth 使用 PKCE；通常不需要 Client Secret，只有你的 Google 客户端明确要求时才配置它。
+发布工作流只从 GitHub Actions 的 `AGY_GOOGLE_OAUTH_CLIENT_ID` 读取该公开标识，并在其缺失时中止构建，避免发布不可用安装包。工作流和安装包均不接收、保存或内置 Client Secret。桌面 OAuth 使用 PKCE；普通用户不需要、也不应拥有 Client Secret。不要把真实 secret 写入 `.env.example`、源代码、构建日志或公开仓库。
 
 构建安装包：
 
 ```powershell
+# 本地构建可分发安装包时，需提供构建期注入的公开 Client ID：
+$env:AGY_BUNDLED_GOOGLE_OAUTH_CLIENT_ID = "你的客户端 ID"
 npm run tauri build
 ```
+
+未配置构建期 ID 的本地安装包仍可由运行期 `AGY_GOOGLE_OAUTH_CLIENT_ID` 覆盖；它不应作为面向普通用户的发布包。GitHub Release 构建会在缺少构建期 ID 时失败。
 
 #### esbuild 版本不匹配
 

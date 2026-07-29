@@ -4,6 +4,14 @@
 
 ---
 
+## [0.1.2] - 未发布
+
+- **[修复] 发布包 OAuth 可用性**: GitHub Release 构建在编译期注入公开的 Google OAuth Client ID；安装后的普通用户无需自行设置环境变量。
+- **[安全] 凭据边界**: 运行期 Client ID 可覆盖内置值；Client Secret 不会进入 CI、二进制、安装包或发布资产。
+- **[防回归] 构建保护**: CI 在 Client ID 未配置时中止构建，避免再次发布无法完成登录和配额刷新的安装包。
+
+---
+
 ## [2026-07-29] OAuth 与本机凭据安全加固审查
 
 - **安全审查记录**: [docs/security/2026-07-29-security-review.md](security/2026-07-29-security-review.md)

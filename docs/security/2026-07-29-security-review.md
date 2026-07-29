@@ -12,11 +12,11 @@ Agy Switch 需要在当前用户的本机边界内保存 refresh token、向 Goo
 
 ## 已采纳的决策
 
-### 1. OAuth 配置只从运行环境取得
+### 1. 发布包内置构建期 Client ID，运行期可覆盖
 
-应用要求显式配置 `AGY_GOOGLE_OAUTH_CLIENT_ID`；只有 OAuth 客户端确实要求时才读取可选的 `AGY_GOOGLE_OAUTH_CLIENT_SECRET`。不再在源码中提供客户端 ID 或 secret fallback。
+发布 CI 只把公开的 OAuth Client ID 作为 `AGY_BUNDLED_GOOGLE_OAUTH_CLIENT_ID` 传给编译器，二进制将其作为回退值；运行期 `AGY_GOOGLE_OAUTH_CLIENT_ID` 优先，可用于开发、测试或自有客户端覆盖。官方安装包不要求终端用户配置环境变量。
 
-原因是桌面端采用 PKCE 时不应依赖公开分发客户端中的内置 secret。这样可避免新构建再次把凭据带入二进制、源码或发布链路。具体启动方式见 [根 README 的 Google OAuth 配置](../../README.md#google-oauth-配置)。
+桌面端采用 PKCE，Google 的 installed app 模型也假定客户端无法保存 secret。因此 Client ID 可随安装包分发，Client Secret 绝不进入源码、CI 构建环境、二进制、安装包或发布资产。只有自定义客户端在本机运行时明确要求时，才可读取可选的 `AGY_GOOGLE_OAUTH_CLIENT_SECRET`。具体启动方式见 [根 README 的 Google OAuth 配置](../../README.md#google-oauth-配置)。
 
 ### 2. OAuth 授权码使用 PKCE 与单次状态绑定
 
@@ -36,21 +36,21 @@ OAuth 授权使用 PKCE S256、一次性 state 和受控回调；refresh token �
 
 这样即使未来 renderer 代码受影响，也不会额外获得任意 HTTP(S) opener IPC 权限。
 
-### 5. 发布流程不携带 OAuth 配置
+### 5. 发布流程只携带公开 Client ID，并拒绝无配置构建
 
-GitHub Actions 使用不可变 action SHA，release job 仅保留创建发布所需的 `GITHUB_TOKEN`，不再将 OAuth client 配置作为构建环境变量。
+GitHub Actions 使用不可变 action SHA；release job 从 `AGY_GOOGLE_OAUTH_CLIENT_ID` 读取公开标识并映射为编译期变量 `AGY_BUNDLED_GOOGLE_OAUTH_CLIENT_ID`。构建前会检查该值非空，缺失即失败，避免再次生成安装后无法登录或刷新配额的包。
 
-该选择降低第三方 action 供应链变化对 OAuth 配置的影响，但不替代发布前的 secret 扫描。
+release job 只保留 `GITHUB_TOKEN` 和上述 Client ID，不注入 Client Secret。该选择不替代发布前的 secret 扫描。
 
 ## 风险状态与验收结果
 
 | 风险面 | 当前结论 | 依据与下一步 |
 | --- | --- | --- |
-| OAuth 回调、PKCE 与 Google 出站请求 | 已完成静态审查 | 代码使用 state/PKCE、HTTPS 和受控重定向；在 Windows/macOS 实机完成 OAuth 浏览器流验收。 |
+| OAuth 回调、PKCE 与 Google 出站请求 | 已完成静态审查 | 代码使用 state/PKCE、HTTPS、受控重定向及构建期 Client ID 回退；在 Windows/macOS 实机完成 OAuth 浏览器流验收。 |
 | 本地账户库、导出和数据库备份 | 已完成代码修复 | 账户文件权限、DPAPI 迁移、原生导出确认和私有备份创建均已实现；在原生系统验证导出确认与目标写入。 |
 | WSL/Windows 凭据边界 | 已完成静态审查 | WSL 仅写入默认发行版的当前 Linux 用户；Windows Credential Manager 行为须在 Windows 验收。 |
 | Tauri IPC/CSP/capability | 已完成代码修复 | 删除 token-returning export handler 与 renderer opener 权限；继续保持前端不渲染不可信 HTML。 |
-| CI 供应链 | 已完成代码修复 | action 已固定 SHA，构建 job 不接收 OAuth 配置；发布前仍需检查新增依赖与 secret 扫描结果。 |
+| CI 供应链 | 已完成代码修复 | action 已固定 SHA，构建 job 只接收公开 Client ID，并在缺失时失败；发布前仍需检查新增依赖、GitHub 配置与 secret 扫描结果。 |
 | 公开 Git 历史中的旧 OAuth 凭据 | **待外部处置** | 当前源码删除不能删除已发布历史对象；必须先由 OAuth 提供方撤销或轮换，再经仓库所有者授权处理分支、标签、fork/mirror 和发布资产。 |
 | macOS Keychain 写入 | **待原生验证** | 现有 `security -w` 路径需要在 macOS 测量进程参数可见性，并验证替代方案与目标应用兼容。 |
 
@@ -84,7 +84,7 @@ GitHub Actions 使用不可变 action SHA，release job 仅保留创建发布所
 ## 发布前安全检查清单
 
 - [ ] 确认 `.env.example`、README、源码、构建日志和 release asset 中没有真实 token 或 client secret。
-- [ ] 检查每个新增或修改的 GitHub Action 是否使用不可变 SHA，并确认 release job 未注入 OAuth 配置。
+- [ ] 检查每个新增或修改的 GitHub Action 是否使用不可变 SHA，并确认 release job 仅注入公开 Client ID、未注入 Client Secret，且缺少 Client ID 时会失败。
 - [ ] 在 Windows 完成 OAuth、导入、导出、三端切换和配额查询的实机回归。
 - [ ] 在 macOS 完成 OAuth/Keychain 原生验证，关闭参数可见性问题或记录经验证的剩余风险。
 - [ ] 如处理过公开历史，先确认 OAuth 提供方的撤销/轮换，再执行经授权的分支/标签处置并复核可达性。
