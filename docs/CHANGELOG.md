@@ -4,7 +4,15 @@
 
 ---
 
-## [0.1.2] - 未发布
+## [0.1.3] - 2026-08-04
+
+- **[修复] Windows SOCKS 系统代理**: 模型配额刷新会保留 Windows PAC 与系统代理返回的 `SOCKS`/`SOCKS5` 传输协议，不再错误地把 SOCKS 地址当作 HTTP 代理。
+- **[兼容性] 代理客户端**: 启用 HTTP 客户端的 SOCKS 支持，兼容 `SOCKS5 host:port` 与 `socks=host:port` 两种 Windows 代理格式。
+- **[防回归] 代理解析测试**: 覆盖 PAC 指令和手动 SOCKS 系统代理设置，防止后续更新再次降级传输协议。
+
+---
+
+## [0.1.2] - 2026-07-29
 
 - **[修复] 发布包 OAuth 可用性**: GitHub Release 构建在编译期注入公开的 Google OAuth Client ID；安装后的普通用户无需自行设置环境变量。
 - **[安全] 凭据边界**: 运行期 Client ID 可覆盖内置值；Client Secret 不会进入 CI、二进制、安装包或发布资产。

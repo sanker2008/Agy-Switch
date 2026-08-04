@@ -1050,19 +1050,24 @@ fn proxy_url_from_windows_proxy_list(proxy_list: &str, request_url: &str) -> Opt
             }
         }
 
-        let endpoint = endpoint
+        let (endpoint, proxy_scheme) = endpoint
             .strip_prefix("PROXY ")
             .or_else(|| endpoint.strip_prefix("proxy "))
             .or_else(|| endpoint.strip_prefix("HTTPS "))
             .or_else(|| endpoint.strip_prefix("https "))
             .or_else(|| endpoint.strip_prefix("HTTP "))
             .or_else(|| endpoint.strip_prefix("http "))
-            .or_else(|| endpoint.strip_prefix("SOCKS5 "))
-            .or_else(|| endpoint.strip_prefix("socks5 "))
-            .or_else(|| endpoint.strip_prefix("SOCKS "))
-            .or_else(|| endpoint.strip_prefix("socks "))
-            .unwrap_or(endpoint)
-            .trim();
+            .map(|endpoint| (endpoint, None))
+            .or_else(|| {
+                endpoint
+                    .strip_prefix("SOCKS5 ")
+                    .or_else(|| endpoint.strip_prefix("socks5 "))
+                    .or_else(|| endpoint.strip_prefix("SOCKS "))
+                    .or_else(|| endpoint.strip_prefix("socks "))
+                    .map(|endpoint| (endpoint, Some("socks5")))
+            })
+            .unwrap_or((endpoint, None));
+        let endpoint = endpoint.trim();
         if endpoint.is_empty() || endpoint.eq_ignore_ascii_case("DIRECT") {
             continue;
         }
@@ -1070,11 +1075,16 @@ fn proxy_url_from_windows_proxy_list(proxy_list: &str, request_url: &str) -> Opt
         let url = if endpoint.contains("://") {
             endpoint.to_string()
         } else {
-            format!("http://{endpoint}")
+            let scheme = proxy_scheme.or_else(|| {
+                matches!(protocol.as_deref(), Some("socks") | Some("socks5")).then_some("socks5")
+            });
+            format!("{}://{endpoint}", scheme.unwrap_or("http"))
         };
         if Url::parse(&url)
             .ok()
-            .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+            .filter(|url| {
+                matches!(url.scheme(), "http" | "https" | "socks5") && url.host_str().is_some()
+            })
             .is_some()
         {
             if protocol.as_deref() == Some(request_scheme.as_str()) {
@@ -3274,6 +3284,24 @@ mod tests {
                 "https://oauth2.googleapis.com/token",
             ),
             Some("http://127.0.0.1:10808".to_string())
+        );
+    }
+
+    #[test]
+    fn preserves_socks_transport_from_windows_proxy_settings() {
+        assert_eq!(
+            proxy_url_from_windows_proxy_list(
+                "SOCKS5 127.0.0.1:10808; DIRECT",
+                "https://oauth2.googleapis.com/token",
+            ),
+            Some("socks5://127.0.0.1:10808".to_string())
+        );
+        assert_eq!(
+            proxy_url_from_windows_proxy_list(
+                "socks=127.0.0.1:10808",
+                "https://oauth2.googleapis.com/token",
+            ),
+            Some("socks5://127.0.0.1:10808".to_string())
         );
     }
 

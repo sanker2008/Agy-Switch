@@ -32,7 +32,7 @@
 5. 在右侧配额区点击“刷新”，查看该账号可用模型的剩余配额和重置时间；工具栏的“刷新全部配额”会顺序刷新全部账号。
 6. 点击工具栏“导出备份”保存本地账号；在“添加账号 → 导入账号”中可导入 Agy Switch 备份或 V1 备份。
 
-模型配额直接使用账号的短期 access token 查询 Antigravity Cloud Code 服务；access token 即将过期时会先用本地保存的 refresh token 更新。查询失败不会删除账号或原有的配额缓存。账号无权访问配额时，界面会明确显示“无权读取”。
+模型配额直接使用账号的短期 access token 查询 Antigravity Cloud Code 服务；access token 即将过期时会先用本地保存的 refresh token 更新。Windows 上会兼容系统代理和 PAC 返回的 HTTP/HTTPS/SOCKS5 代理；查询失败不会删除账号或原有的配额缓存。账号无权访问配额时，界面会明确显示“无权读取”。
 
 ## 添加账号的数据来源
 
@@ -108,7 +108,7 @@ WSL 中编译 Tauri Linux 桌面程序需要本机 GTK/GLib 开发依赖，且�
 - refresh token 等同长期账号凭据；Unix/WSL 上的 `~/.agy-switch` 目录及其中账户文件会强制设为仅当前用户可读写。Windows 账户库使用当前用户的 DPAPI 加密，旧版明文账户库会在首次读取时自动迁移。
 - Agy Switch 导出的 JSON 备份也包含 refresh token；导出前会再次确认，并会在 Unix/WSL 上以仅当前用户可读写的权限创建。不要通过聊天、邮件或公共仓库传输。
 - WSL CLI 切换只会写入 Windows 默认 WSL 发行版中当前 Linux 用户的 `~/.gemini/antigravity-cli/credentials.json`，不会扫描或修改其他发行版及用户目录。
-- Google 网络请求只允许 HTTPS 且不会跟随重定向。在 Windows 上会遵从系统代理；如公司代理实施 TLS 解密，请只在你信任该代理和根证书时进行 OAuth、账号导入或配额刷新。
+- Google 网络请求只允许 HTTPS 且不会跟随重定向。在 Windows 上会遵从系统代理，支持 HTTP/HTTPS 和 SOCKS5 出站代理；如公司代理实施 TLS 解密，请只在你信任该代理和根证书时进行 OAuth、账号导入或配额刷新。
 - 删除账号只删除 Agy Switch 的本地记录，不会删除 Google 账号、系统凭据或旧项目数据。
 - 首次切换 Antigravity IDE 前，先手动启动一次 IDE，确保已创建 `state.vscdb`。
 - 从数据库导入需要读取已登录程序的 `state.vscdb`；请只选择你信任的本地数据库文件。
