@@ -8,6 +8,7 @@ import {
   Download,
   FileClock,
   Globe,
+  Info,
   KeyRound,
   Link,
   LoaderCircle,
@@ -142,6 +143,9 @@ function extractRefreshTokens(value: string): string[] {
 }
 
 type AccentColor = "teal" | "violet" | "cyan" | "amber";
+type Notice = { type: "success" | "error" | "info"; text: string };
+
+const noticeDuration = (type: Notice["type"]) => (type === "error" ? 9_000 : 5_000);
 
 function App() {
   const [lang, setLang] = useState<Language>(() => (localStorage.getItem("agy_lang") as Language) || "zh-CN");
@@ -182,15 +186,42 @@ function App() {
   const [selectedAccountId, setSelectedAccountId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [pending, setPending] = useState<string | null>(null);
-  const [notice, setNotice] = useState<{ type: "success" | "error"; text: string } | null>(null);
+  const [notice, setNoticeState] = useState<Notice | null>(null);
   const [showAdd, setShowAdd] = useState(false);
   const [addTab, setAddTab] = useState<AddAccountTab>("oauth");
   const [refreshToken, setRefreshToken] = useState("");
   const [oauthUrl, setOauthUrl] = useState("");
   const [manualOAuthCode, setManualOAuthCode] = useState("");
-  const [addMessage, setAddMessage] = useState<string | null>(null);
   const [showQuotaModal, setShowQuotaModal] = useState(false);
   const oauthCompletionInFlight = useRef(false);
+  const noticeTimer = useRef<number | null>(null);
+
+  const dismissNotice = () => {
+    if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
+    noticeTimer.current = null;
+    setNoticeState(null);
+  };
+
+  const setNotice = (next: Notice | null) => {
+    if (next === null) {
+      dismissNotice();
+      return;
+    }
+    if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
+    setNoticeState(next);
+    noticeTimer.current = window.setTimeout(() => {
+      noticeTimer.current = null;
+      setNoticeState(null);
+    }, noticeDuration(next.type));
+  };
+
+  const showAddMessage = (text: string | null, type: Notice["type"] = "info") => {
+    if (text) setNotice({ type, text });
+  };
+
+  useEffect(() => () => {
+    if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
+  }, []);
 
   const refresh = async () => {
     setLoading(true);
@@ -222,7 +253,7 @@ function App() {
         if (!cancelled) setOauthUrl(url);
       })
       .catch((error) => {
-        if (!cancelled) setAddMessage(`无法准备 OAuth 授权：${String(error)}`);
+        if (!cancelled) showAddMessage(`无法准备 OAuth 授权：${String(error)}`, "error");
       });
     return () => {
       cancelled = true;
@@ -254,12 +285,10 @@ function App() {
     setOauthUrl("");
     setManualOAuthCode("");
     setRefreshToken("");
-    setAddMessage(null);
   };
 
   const openAdd = () => {
     setAddTab("oauth");
-    setAddMessage(null);
     setShowAdd(true);
   };
 
@@ -269,14 +298,13 @@ function App() {
       setOauthUrl("");
       setManualOAuthCode("");
     }
-    setAddMessage(null);
     setAddTab(tab);
   };
 
   const handleTokenAdd = async () => {
     const tokens = extractRefreshTokens(refreshToken);
     if (!tokens.length) {
-      setAddMessage("请粘贴有效的 refresh token，或包含 refresh_token 的 JSON 数组。");
+      showAddMessage("请粘贴有效的 refresh token，或包含 refresh_token 的 JSON 数组。", "error");
       return;
     }
     setPending("add:token");
@@ -290,7 +318,7 @@ function App() {
         } catch {
           failed += 1;
         }
-        setAddMessage(`正在保存账号：${index + 1}/${tokens.length}`);
+        showAddMessage(`正在保存账号：${index + 1}/${tokens.length}`);
       }
       await refresh();
       if (succeeded) {
@@ -300,7 +328,7 @@ function App() {
         });
         if (!failed) closeAdd();
       } else {
-        setAddMessage("所有 refresh token 都未能保存；请检查其是否有效或账号是否已存在。");
+        showAddMessage("所有 refresh token 都未能保存；请检查其是否有效或账号是否已存在。", "error");
       }
     } finally {
       setPending(null);
@@ -309,11 +337,11 @@ function App() {
 
   const startOAuth = async () => {
     setPending("add:oauth:start");
-    setAddMessage("正在打开默认浏览器，请完成 Google 授权…");
+    showAddMessage("正在打开默认浏览器，请完成 Google 授权…");
     try {
       await call<void>("open_oauth_browser");
     } catch (error) {
-      setAddMessage(`无法打开浏览器：${String(error)}`);
+      showAddMessage(`无法打开浏览器：${String(error)}`, "error");
     } finally {
       setPending(null);
     }
@@ -323,14 +351,14 @@ function App() {
     if (oauthCompletionInFlight.current) return;
     oauthCompletionInFlight.current = true;
     setPending("add:oauth:complete");
-    setAddMessage("正在保存已授权账号…");
+    showAddMessage("正在保存已授权账号…");
     try {
       const account = await call<Account>("complete_oauth_login");
       setNotice({ type: "success", text: `已添加 ${account.email}。` });
       await refresh();
       closeAdd();
     } catch (error) {
-      setAddMessage(`OAuth 授权失败：${String(error)}`);
+      showAddMessage(`OAuth 授权失败：${String(error)}`, "error");
     } finally {
       oauthCompletionInFlight.current = false;
       setPending(null);
@@ -344,7 +372,7 @@ function App() {
       await call<void>("submit_oauth_code", { codeOrCallbackUrl: manualOAuthCode.trim() });
       await completeOAuth();
     } catch (error) {
-      setAddMessage(`提交授权码失败：${String(error)}`);
+      showAddMessage(`提交授权码失败：${String(error)}`, "error");
       setPending(null);
     }
   };
@@ -352,9 +380,9 @@ function App() {
   const copyOAuthUrl = async () => {
     try {
       await navigator.clipboard.writeText(oauthUrl);
-      setAddMessage("授权链接已复制。若浏览器没有自动打开，请粘贴到浏览器中完成登录。");
+      showAddMessage("授权链接已复制。若浏览器没有自动打开，请粘贴到浏览器中完成登录。", "success");
     } catch {
-      setAddMessage("无法自动复制，请手动复制下方完整授权链接。");
+      showAddMessage("无法自动复制，请手动复制下方完整授权链接。", "error");
     }
   };
 
@@ -363,7 +391,7 @@ function App() {
     payload: Record<string, unknown>,
   ) => {
     setPending("add:database");
-    setAddMessage(t(lang, "validatingAccounts"));
+    showAddMessage(t(lang, "validatingAccounts"));
     try {
       const result = await call<DatabaseImportResult>(command, payload);
       const text = result.outcome === "added"
@@ -375,7 +403,7 @@ function App() {
       await refresh();
       closeAdd();
     } catch (error) {
-      setAddMessage(`数据库导入失败：${String(error)}`);
+      showAddMessage(`数据库导入失败：${String(error)}`, "error");
     } finally {
       setPending(null);
     }
@@ -383,14 +411,14 @@ function App() {
 
   const importV1Backups = async () => {
     setPending("add:v1");
-    setAddMessage(t(lang, "scanningV1"));
+    showAddMessage(t(lang, "scanningV1"));
     try {
       const result = await call<ImportResult>("import_v1_accounts");
       await refresh();
       setNotice({ type: "success", text: t(lang, "importV1Success", { imported: result.imported, updated: result.updated }) });
       closeAdd();
     } catch (error) {
-      setAddMessage(`V1 备份导入失败：${String(error)}`);
+      showAddMessage(`V1 备份导入失败：${String(error)}`, "error");
     } finally {
       setPending(null);
     }
@@ -404,7 +432,7 @@ function App() {
       });
       if (typeof selected === "string") await importDatabase("import_database_file", { path: selected });
     } catch (error) {
-      setAddMessage(`无法选择数据库文件：${String(error)}`);
+      showAddMessage(`无法选择数据库文件：${String(error)}`, "error");
     }
   };
 
@@ -433,13 +461,13 @@ function App() {
       });
       if (typeof selected !== "string") return;
       setPending("add:backup");
-      setAddMessage("正在验证并导入 Agy Switch 账号备份…");
+      showAddMessage("正在验证并导入 Agy Switch 账号备份…");
       const result = await call<ImportResult>("import_backup_file", { path: selected });
       await refresh();
       setNotice({ type: "success", text: `账号备份导入完成：新增 ${result.imported} 个，更新 ${result.updated} 个。` });
       closeAdd();
     } catch (error) {
-      setAddMessage(`账号备份导入失败：${String(error)}`);
+      showAddMessage(`账号备份导入失败：${String(error)}`, "error");
     } finally {
       setPending(null);
     }
@@ -570,11 +598,17 @@ function App() {
         </div>
       </header>
 
-      {notice && (
-        <div className={`notice ${notice.type}`} role="status">
-          <span>{notice.text}</span>
-          <button type="button" onClick={() => setNotice(null)} title={t(lang, "close")}><X size={16} /></button>
-        </div>
+      {notice && createPortal(
+        <div
+          className={`toast ${notice.type}`}
+          role={notice.type === "error" ? "alert" : "status"}
+          aria-live={notice.type === "error" ? "assertive" : "polite"}
+        >
+          {notice.type === "success" ? <CheckCircle2 size={19} /> : notice.type === "error" ? <CircleAlert size={19} /> : <Info size={19} />}
+          <p>{notice.text}</p>
+          <button type="button" onClick={dismissNotice} aria-label={t(lang, "close")} title={t(lang, "close")}><X size={16} /></button>
+        </div>,
+        document.body,
       )}
 
       <section className="switch-hero" aria-label={t(lang, "quickSwitch")}>
@@ -813,8 +847,6 @@ function App() {
               <button type="button" className={addTab === "token" ? "active" : ""} onClick={() => changeAddTab("token")}><KeyRound size={15} /> {t(lang, "tabToken")}</button>
               <button type="button" className={addTab === "database" ? "active" : ""} onClick={() => changeAddTab("database")}><Database size={15} /> {t(lang, "tabDatabase")}</button>
             </div>
-
-            {addMessage && <p className="add-status">{addMessage}</p>}
 
             {addTab === "oauth" && (
               <section className="add-panel oauth-panel">
