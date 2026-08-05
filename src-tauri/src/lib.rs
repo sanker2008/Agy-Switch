@@ -654,10 +654,7 @@ async fn refresh_token(refresh_token: &str) -> Result<GoogleTokenResponse, Strin
     if let Some(secret) = oauth_client.secret.as_deref() {
         form.push(("client_secret", secret));
     }
-    let response = google_http_client(GOOGLE_TOKEN_URL)?
-        .post(GOOGLE_TOKEN_URL)
-        .form(&form)
-        .send()
+    let response = send_google_token_request(&form)
         .await
         .map_err(|error| format!("无法连接 Google 授权服务：{error}"))?;
 
@@ -674,8 +671,46 @@ async fn refresh_token(refresh_token: &str) -> Result<GoogleTokenResponse, Strin
     ))
 }
 
+fn should_retry_google_request_directly(
+    used_windows_system_proxy: bool,
+    connection_or_timeout_failed: bool,
+) -> bool {
+    used_windows_system_proxy && connection_or_timeout_failed
+}
+
+async fn send_google_token_request(form: &[(&str, &str)]) -> Result<reqwest::Response, String> {
+    #[cfg(target_os = "windows")]
+    let used_windows_system_proxy = windows_system_proxy_for_url(GOOGLE_TOKEN_URL).is_some();
+    #[cfg(not(target_os = "windows"))]
+    let used_windows_system_proxy = false;
+
+    let client = google_http_client(GOOGLE_TOKEN_URL, false)?;
+    match client.post(GOOGLE_TOKEN_URL).form(form).send().await {
+        Ok(response) => Ok(response),
+        Err(proxy_error)
+            if should_retry_google_request_directly(
+                used_windows_system_proxy,
+                proxy_error.is_connect() || proxy_error.is_timeout(),
+            ) =>
+        {
+            let direct_client = google_http_client(GOOGLE_TOKEN_URL, true)?;
+            direct_client
+                .post(GOOGLE_TOKEN_URL)
+                .form(form)
+                .send()
+                .await
+                .map_err(|direct_error| {
+                    format!(
+                        "Windows 系统代理连接失败：{proxy_error}；禁用应用层代理后重试仍失败：{direct_error}"
+                    )
+                })
+        }
+        Err(error) => Err(error.to_string()),
+    }
+}
+
 async fn fetch_email(access_token: &str) -> Result<String, String> {
-    let response = google_http_client(GOOGLE_USERINFO_URL)?
+    let response = google_http_client(GOOGLE_USERINFO_URL, false)?
         .get(GOOGLE_USERINFO_URL)
         .bearer_auth(access_token)
         .send()
@@ -921,7 +956,7 @@ async fn exchange_oauth_code(
     if let Some(secret) = oauth_client.secret.as_deref() {
         form.push(("client_secret", secret));
     }
-    let response = google_http_client(GOOGLE_TOKEN_URL)?
+    let response = google_http_client(GOOGLE_TOKEN_URL, false)?
         .post(GOOGLE_TOKEN_URL)
         .form(&form)
         .send()
@@ -1254,7 +1289,10 @@ fn windows_system_proxy_for_url(request_url: &str) -> Option<String> {
     }
 }
 
-fn google_http_client(request_url: &str) -> Result<reqwest::Client, String> {
+fn google_http_client(
+    request_url: &str,
+    bypass_windows_system_proxy: bool,
+) -> Result<reqwest::Client, String> {
     let builder = reqwest::Client::builder()
         .https_only(true)
         .redirect(reqwest::redirect::Policy::none())
@@ -1262,11 +1300,22 @@ fn google_http_client(request_url: &str) -> Result<reqwest::Client, String> {
         .timeout(Duration::from_secs(20));
 
     #[cfg(target_os = "windows")]
-    let builder = if let Some(proxy_url) = windows_system_proxy_for_url(request_url) {
+    let builder = if bypass_windows_system_proxy {
+        // TUN works below the application proxy layer. Disabling the selected Windows proxy here
+        // lets a failed local/PAC proxy retry through the TUN route without weakening HTTPS.
+        builder.no_proxy()
+    } else if let Some(proxy_url) = windows_system_proxy_for_url(request_url) {
         builder.proxy(
             reqwest::Proxy::all(&proxy_url)
                 .map_err(|error| format!("Windows 系统代理配置无效：{error}"))?,
         )
+    } else {
+        builder
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let builder = if bypass_windows_system_proxy {
+        builder.no_proxy()
     } else {
         builder
     };
@@ -1277,7 +1326,7 @@ fn google_http_client(request_url: &str) -> Result<reqwest::Client, String> {
 }
 
 async fn load_code_assist(access_token: &str) -> Result<(Option<String>, Option<String>), String> {
-    let response = google_http_client(CLOUD_CODE_LOAD_ASSIST_URL)?
+    let response = google_http_client(CLOUD_CODE_LOAD_ASSIST_URL, false)?
         .post(CLOUD_CODE_LOAD_ASSIST_URL)
         .bearer_auth(access_token)
         .header(reqwest::header::USER_AGENT, QUOTA_USER_AGENT)
@@ -1347,7 +1396,7 @@ async fn fetch_available_models(
     let mut last_error = "模型配额服务没有可用响应。".to_string();
 
     for endpoint in QUOTA_API_ENDPOINTS {
-        let client = google_http_client(endpoint)?;
+        let client = google_http_client(endpoint, false)?;
         let mut payload = initial_payload.clone();
         let mut retried_without_project = false;
         loop {
@@ -3211,9 +3260,9 @@ fn remove_unified_topic_entry(data: &[u8], target_key: &str) -> Result<Vec<u8>, 
 mod tests {
     use super::{
         backup_db, database_import_outcome, is_oauth_config_key, oauth_client_from_values,
-        pkce_challenge, proxy_url_from_windows_proxy_list, sort_state_db_candidates,
-        user_data_dir_from_command_line, write_file_atomically, DatabaseImportOutcome,
-        WSL_CREDENTIAL_READ_COMMAND, WSL_CREDENTIAL_WRITE_COMMAND,
+        pkce_challenge, proxy_url_from_windows_proxy_list, should_retry_google_request_directly,
+        sort_state_db_candidates, user_data_dir_from_command_line, write_file_atomically,
+        DatabaseImportOutcome, WSL_CREDENTIAL_READ_COMMAND, WSL_CREDENTIAL_WRITE_COMMAND,
     };
     use std::{
         ffi::OsString,
@@ -3322,6 +3371,14 @@ mod tests {
             proxy_url_from_windows_proxy_list("DIRECT", "https://oauth2.googleapis.com/token"),
             None
         );
+    }
+
+    #[test]
+    fn retries_directly_only_after_a_system_proxy_connection_failure() {
+        assert!(should_retry_google_request_directly(true, true));
+        assert!(should_retry_google_request_directly(true, false));
+        assert!(!should_retry_google_request_directly(false, true));
+        assert!(!should_retry_google_request_directly(false, false));
     }
 
     #[test]

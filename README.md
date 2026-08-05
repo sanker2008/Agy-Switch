@@ -32,7 +32,7 @@
 5. 在右侧配额区点击“刷新”，查看该账号可用模型的剩余配额和重置时间；工具栏的“刷新全部配额”会顺序刷新全部账号。
 6. 点击工具栏“导出备份”保存本地账号；在“添加账号 → 导入账号”中可导入 Agy Switch 备份或 V1 备份。
 
-模型配额直接使用账号的短期 access token 查询 Antigravity Cloud Code 服务；access token 即将过期时会先用本地保存的 refresh token 更新。Windows 上会兼容系统代理和 PAC 返回的 HTTP/HTTPS/SOCKS5 代理；查询失败不会删除账号或原有的配额缓存。账号无权访问配额时，界面会明确显示“无权读取”。
+模型配额直接使用账号的短期 access token 查询 Antigravity Cloud Code 服务；access token 即将过期时会先用本地保存的 refresh token 更新。Windows 上会兼容系统代理和 PAC 返回的 HTTP/HTTPS/SOCKS5 代理；若系统代理连接或超时失败，会自动重试一次直连请求，以便由全局 TUN 接管。查询失败不会删除账号或原有的配额缓存。账号无权访问配额时，界面会明确显示“无权读取”。
 
 ## 添加账号的数据来源
 
