@@ -4,6 +4,14 @@
 
 ---
 
+## [0.1.5] - 2026-08-05
+
+- **[修复] OAuth 客户端不匹配诊断**: 不再把 Google 的所有 HTTP 400 都笼统显示为“Refresh token 无效”；现在会区分 `invalid_grant`、`invalid_client` 与 `invalid_request`，并给出同邮箱重新授权的恢复路径。
+- **[修复] Refresh token 轮换持久化**: Google 刷新响应若返回新的 refresh token，会立即替换本地旧值；响应未返回新值时继续保留原值。
+- **[恢复] 同邮箱 OAuth 更新**: 配额刷新发现 OAuth 凭据不兼容时会自动打开 OAuth 弹窗；使用 Agy Switch 登录同一邮箱后更新原账号，不重复创建记录。
+- **[交互] 全局浮动 Toast**: 成功、错误、校验、OAuth 与导入进度统一改为右上角浮动 Toast；错误提示停留更久，支持手动关闭和窄窗口布局。
+- **[安全] 第三方 OAuth 边界**: 不把 Antigravity-Manager 的 Client Secret 复制到源码、CI 或安装包。第三方客户端签发的 refresh token 必须通过 Agy Switch 自己的 OAuth 客户端重新授权后才能长期刷新。
+
 ## [0.1.4] - 2026-08-05
 
 - **[修复] TUN 直连兜底**: Windows 系统代理在刷新 Google access token 时发生连接或超时错误，会自动禁用应用层代理后重试一次。启用全局 TUN 时，该重试由 TUN 接管。

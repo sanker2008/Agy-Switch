@@ -238,6 +238,12 @@ struct GoogleTokenResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct GoogleOAuthErrorResponse {
+    #[serde(default)]
+    error: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct GoogleUserInfo {
     email: String,
 }
@@ -644,6 +650,48 @@ fn token_is_fresh(token: &StoredToken) -> bool {
     token.expires_at > now_timestamp() + TOKEN_REFRESH_SKEW_SECONDS
 }
 
+fn google_token_error(status: reqwest::StatusCode, body: &str) -> String {
+    let error_code = serde_json::from_str::<GoogleOAuthErrorResponse>(body)
+        .ok()
+        .map(|response| response.error)
+        .filter(|code| !code.trim().is_empty());
+
+    match error_code.as_deref() {
+        Some("invalid_grant") => concat!(
+            "Google 拒绝该 refresh token（invalid_grant）。它已失效，或由其他 OAuth 客户端签发。",
+            "若该账号来自 Antigravity-Manager，请在 Agy Switch 中通过“添加账号 → OAuth 授权”重新登录同一邮箱；原账号会自动更新。"
+        )
+        .to_string(),
+        Some("invalid_client") => concat!(
+            "Google 拒绝当前 OAuth 客户端配置（invalid_client）。",
+            "请使用 Agy Switch 自己的 OAuth 授权重新登录，不要复用其他应用签发的 refresh token。"
+        )
+        .to_string(),
+        Some("invalid_request") => concat!(
+            "Google 拒绝当前 OAuth 刷新请求（invalid_request）。",
+            "该 refresh token 可能要求签发它的客户端凭据；请在 Agy Switch 中通过 OAuth 重新授权同一邮箱。"
+        )
+        .to_string(),
+        Some(code) => format!("Google 刷新 Token 失败（HTTP {status}，{code}）。"),
+        None => format!("Google 刷新 Token 失败（HTTP {status}）。"),
+    }
+}
+
+fn apply_refreshed_token(stored: &mut StoredToken, refreshed: GoogleTokenResponse) {
+    stored.access_token = refreshed.access_token;
+    stored.expires_at = now_timestamp() + refreshed.expires_in.max(0);
+    if let Some(refresh_token) = refreshed
+        .refresh_token
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        stored.refresh_token = refresh_token;
+    }
+    if refreshed.id_token.is_some() {
+        stored.id_token = refreshed.id_token;
+    }
+}
+
 async fn refresh_token(refresh_token: &str) -> Result<GoogleTokenResponse, String> {
     let oauth_client = google_oauth_client()?;
     let mut form = vec![
@@ -665,10 +713,9 @@ async fn refresh_token(refresh_token: &str) -> Result<GoogleTokenResponse, Strin
             .map_err(|error| format!("Google 授权响应无法解析：{error}"));
     }
 
-    Err(format!(
-        "Refresh token 无效或不可用（HTTP {}）。",
-        response.status()
-    ))
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    Err(google_token_error(status, &body))
 }
 
 fn should_retry_google_request_directly(
@@ -745,11 +792,18 @@ async fn build_account(
         email.trim().to_string()
     };
     let now = now_timestamp();
+    let effective_refresh_token = token
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&refresh_token_value)
+        .to_string();
     Ok(StoredAccount {
         id: Uuid::new_v4().to_string(),
         email: resolved_email,
         token: StoredToken {
-            refresh_token: refresh_token_value,
+            refresh_token: effective_refresh_token,
             access_token: token.access_token,
             expires_at: now + token.expires_in.max(0),
             id_token: token.id_token,
@@ -768,11 +822,7 @@ async fn make_fresh(mut account: StoredAccount) -> Result<StoredAccount, String>
         return Ok(account);
     }
     let token = refresh_token(&account.token.refresh_token).await?;
-    account.token.access_token = token.access_token;
-    account.token.expires_at = now_timestamp() + token.expires_in.max(0);
-    if token.id_token.is_some() {
-        account.token.id_token = token.id_token;
-    }
+    apply_refreshed_token(&mut account.token, token);
     Ok(account)
 }
 
@@ -3259,10 +3309,12 @@ fn remove_unified_topic_entry(data: &[u8], target_key: &str) -> Result<Vec<u8>, 
 #[cfg(test)]
 mod tests {
     use super::{
-        backup_db, database_import_outcome, is_oauth_config_key, oauth_client_from_values,
-        pkce_challenge, proxy_url_from_windows_proxy_list, should_retry_google_request_directly,
+        apply_refreshed_token, backup_db, database_import_outcome, google_token_error,
+        is_oauth_config_key, oauth_client_from_values, pkce_challenge,
+        proxy_url_from_windows_proxy_list, should_retry_google_request_directly,
         sort_state_db_candidates, user_data_dir_from_command_line, write_file_atomically,
-        DatabaseImportOutcome, WSL_CREDENTIAL_READ_COMMAND, WSL_CREDENTIAL_WRITE_COMMAND,
+        DatabaseImportOutcome, GoogleTokenResponse, StoredToken, WSL_CREDENTIAL_READ_COMMAND,
+        WSL_CREDENTIAL_WRITE_COMMAND,
     };
     use std::{
         ffi::OsString,
@@ -3418,6 +3470,63 @@ mod tests {
             custom_secret.secret.as_deref(),
             Some("custom-client-secret")
         );
+    }
+
+    #[test]
+    fn reports_actionable_google_oauth_errors_without_echoing_the_response() {
+        let invalid_grant = google_token_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid_grant","error_description":"provider detail"}"#,
+        );
+        assert!(invalid_grant.contains("invalid_grant"));
+        assert!(invalid_grant.contains("添加账号 → OAuth 授权"));
+        assert!(!invalid_grant.contains("provider detail"));
+
+        let invalid_request = google_token_error(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":"invalid_request","error_description":"client_secret is missing"}"#,
+        );
+        assert!(invalid_request.contains("invalid_request"));
+        assert!(invalid_request.contains("OAuth 重新授权"));
+        assert!(!invalid_request.contains("client_secret"));
+    }
+
+    #[test]
+    fn persists_rotated_refresh_tokens_and_preserves_them_when_absent() {
+        let mut stored = StoredToken {
+            refresh_token: "old-refresh".to_string(),
+            access_token: "old-access".to_string(),
+            expires_at: 0,
+            id_token: Some("old-id".to_string()),
+            is_gcp_tos: false,
+            project_id: None,
+        };
+
+        apply_refreshed_token(
+            &mut stored,
+            GoogleTokenResponse {
+                access_token: "new-access".to_string(),
+                expires_in: 3_600,
+                refresh_token: Some("new-refresh".to_string()),
+                id_token: None,
+            },
+        );
+        assert_eq!(stored.access_token, "new-access");
+        assert_eq!(stored.refresh_token, "new-refresh");
+        assert_eq!(stored.id_token.as_deref(), Some("old-id"));
+
+        apply_refreshed_token(
+            &mut stored,
+            GoogleTokenResponse {
+                access_token: "latest-access".to_string(),
+                expires_in: 3_600,
+                refresh_token: None,
+                id_token: Some("latest-id".to_string()),
+            },
+        );
+        assert_eq!(stored.access_token, "latest-access");
+        assert_eq!(stored.refresh_token, "new-refresh");
+        assert_eq!(stored.id_token.as_deref(), Some("latest-id"));
     }
 
     #[test]

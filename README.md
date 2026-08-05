@@ -75,6 +75,12 @@ npm run tauri build
 
 未配置构建期 ID 的本地安装包仍可由运行期 `AGY_GOOGLE_OAUTH_CLIENT_ID` 覆盖；它不应作为面向普通用户的发布包。GitHub Release 构建会在缺少构建期 ID 时失败。
 
+#### 从 Antigravity-Manager 导入后配额刷新出现 HTTP 400
+
+Google refresh token 与签发它的 OAuth 客户端绑定。Antigravity-Manager 使用自己的 OAuth Client ID 与 Client Secret；Agy Switch 发布包使用独立的桌面 OAuth Client ID。因此，从其他应用复制或导入的 refresh token 即使仍能在原应用中刷新，也可能在 Agy Switch 中返回 `invalid_grant`、`invalid_client` 或 `invalid_request`。
+
+遇到此问题时，在 Agy Switch 中点击“添加账号”→“OAuth 授权”，登录报错账号的同一邮箱。授权完成后会更新原账号，不会重复创建；之后的配额刷新使用 Agy Switch 自己签发的凭据。Agy Switch 不会把第三方应用的 Client Secret 复制进源码、CI、二进制或安装包。
+
 #### esbuild 版本不匹配
 
 若启动时出现 `Host version "..." does not match binary version "..."` 或 `The service was stopped`，说明 `node_modules` 中的 esbuild 主程序与 Windows 二进制不属于同一个版本。请先在运行 `tauri dev` 的终端按 `Ctrl+C` 停止旧进程，然后在 **Windows PowerShell** 中执行：
@@ -109,6 +115,7 @@ WSL 中编译 Tauri Linux 桌面程序需要本机 GTK/GLib 开发依赖，且�
 - Agy Switch 导出的 JSON 备份也包含 refresh token；导出前会再次确认，并会在 Unix/WSL 上以仅当前用户可读写的权限创建。不要通过聊天、邮件或公共仓库传输。
 - WSL CLI 切换只会写入 Windows 默认 WSL 发行版中当前 Linux 用户的 `~/.gemini/antigravity-cli/credentials.json`，不会扫描或修改其他发行版及用户目录。
 - Google 网络请求只允许 HTTPS 且不会跟随重定向。在 Windows 上会遵从系统代理，支持 HTTP/HTTPS 和 SOCKS5 出站代理；如公司代理实施 TLS 解密，请只在你信任该代理和根证书时进行 OAuth、账号导入或配额刷新。
+- 从其他应用导入 refresh token 不能改变其 OAuth 客户端归属；若 Google 返回客户端不匹配错误，必须在 Agy Switch 内重新授权同一邮箱。具体原因和恢复步骤见上方“从 Antigravity-Manager 导入后配额刷新出现 HTTP 400”。
 - 删除账号只删除 Agy Switch 的本地记录，不会删除 Google 账号、系统凭据或旧项目数据。
 - 首次切换 Antigravity IDE 前，先手动启动一次 IDE，确保已创建 `state.vscdb`。
 - 从数据库导入需要读取已登录程序的 `state.vscdb`；请只选择你信任的本地数据库文件。

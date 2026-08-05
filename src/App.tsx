@@ -498,7 +498,9 @@ function App() {
       setNotice({ type: "success", text: summary });
       await refresh();
     } catch (error) {
-      setNotice({ type: "error", text: `刷新模型配额失败：${String(error)}` });
+      const message = String(error);
+      if (/invalid_(grant|client|request)/i.test(message)) openAdd();
+      setNotice({ type: "error", text: `刷新模型配额失败：${message}` });
     } finally {
       setPending(null);
     }
