@@ -43,13 +43,18 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Validate packaged OAuth client ID
+      - name: Validate packaged OAuth desktop credentials
         shell: bash
         env:
           AGY_BUNDLED_GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.AGY_GOOGLE_OAUTH_CLIENT_ID }}
+          AGY_BUNDLED_GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.AGY_GOOGLE_OAUTH_CLIENT_SECRET }}
         run: |
           if [[ -z "${AGY_BUNDLED_GOOGLE_OAUTH_CLIENT_ID//[[:space:]]/}" ]]; then
             echo "::error::Missing AGY_GOOGLE_OAUTH_CLIENT_ID. Refusing to build an installer without its bundled OAuth client ID."
+            exit 1
+          fi
+          if [[ -z "${AGY_BUNDLED_GOOGLE_OAUTH_CLIENT_SECRET//[[:space:]]/}" ]]; then
+            echo "::error::Missing AGY_GOOGLE_OAUTH_CLIENT_SECRET for the desktop client."
             exit 1
           fi
 
@@ -58,6 +63,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AGY_BUNDLED_GOOGLE_OAUTH_CLIENT_ID: ${{ secrets.AGY_GOOGLE_OAUTH_CLIENT_ID }}
+          AGY_BUNDLED_GOOGLE_OAUTH_CLIENT_SECRET: ${{ secrets.AGY_GOOGLE_OAUTH_CLIENT_SECRET }}
         with:
           tagName: v__VERSION__
           releaseName: 'Agy Switch v__VERSION__'

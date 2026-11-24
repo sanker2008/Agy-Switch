@@ -25,7 +25,6 @@ import {
   X,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { Language, formatResetTimeI18n, formatTimeI18n, t } from "./i18n";
@@ -53,7 +52,7 @@ interface DatabaseImportResult {
 
 interface ModelQuota {
   name: string;
-  percentage: number;
+  percentage: number | null;
   reset_time: string;
   display_name: string | null;
 }
@@ -66,6 +65,7 @@ interface QuotaData {
 }
 
 interface AccountListResponse {
+  wsl_distribution?: string | null;
   accounts: Account[];
   current_target: SwitchTarget | null;
   target_accounts?: Record<string, string>;
@@ -90,7 +90,7 @@ function getTargetDescriptions(lang: Language): Record<string, string> {
     ide: t(lang, "targetIdeDesc"),
     cli: t(lang, "targetCliDesc"),
     win_cli: t(lang, "targetCliDesc"),
-    wsl_cli: "仅写入默认 WSL 发行版的当前 Linux 用户凭据",
+    wsl_cli: t(lang, "wslDefault"),
   };
 }
 
@@ -109,10 +109,9 @@ async function call<T>(command: string, payload?: Record<string, unknown>): Prom
 function quotaSummary(account: Account, lang: Language): string {
   if (!account.quota) return t(lang, "quotaUnqueried");
   if (account.quota.is_forbidden) return t(lang, "quotaForbidden");
-  if (!account.quota.models.length) return t(lang, "quotaNone");
-  const average = Math.round(
-    account.quota.models.reduce((total, model) => total + model.percentage, 0) / account.quota.models.length,
-  );
+  const values = account.quota.models.flatMap(model => model.percentage === null ? [] : [model.percentage]);
+  if (!values.length) return t(lang, "quotaNone");
+  const average = Math.round(values.reduce((sum, value) => sum + value, 0) / values.length);
   return t(lang, "quotaAvg", { avg: average });
 }
 
@@ -147,7 +146,25 @@ type Notice = { type: "success" | "error" | "info"; text: string };
 
 const noticeDuration = (type: Notice["type"]) => (type === "error" ? 9_000 : 5_000);
 
+function ModelQuotaRow({ model, lang }: { model: ModelQuota; lang: Language }) {
+  return (
+    <div className="model-quota">
+      <div className="model-quota-title">
+        <strong title={model.name}>{model.display_name || model.name}</strong>
+        <span>{model.percentage === null ? t(lang, "quotaUnknown") : `${model.percentage}%`}</span>
+      </div>
+      {model.percentage !== null && (
+        <div className="quota-track" aria-hidden="true"><i style={{ width: `${model.percentage}%` }} /></div>
+      )}
+      {model.reset_time && <small>{t(lang, "reset", { time: formatResetTimeI18n(model.reset_time, lang) })}</small>}
+    </div>
+  );
+}
+
 function App() {
+  const [wslDistribution, setWslDistribution] = useState<string | null>(null);
+  const [quotaIssues, setQuotaIssues] = useState<Record<string, string | null>>({});
+
   const [lang, setLang] = useState<Language>(() => (localStorage.getItem("agy_lang") as Language) || "zh-CN");
   const [theme, setTheme] = useState<"dark" | "light">(() => (localStorage.getItem("agy_theme") as "dark" | "light") || "dark");
   const [accent, setAccent] = useState<AccentColor>(() => (localStorage.getItem("agy_accent") as AccentColor) || "teal");
@@ -194,6 +211,9 @@ function App() {
   const [manualOAuthCode, setManualOAuthCode] = useState("");
   const [showQuotaModal, setShowQuotaModal] = useState(false);
   const oauthCompletionInFlight = useRef(false);
+  const oauthCallbackPending = useRef(false);
+  const oauthSession = oauthUrl ? new URL(oauthUrl).searchParams.get("state") : null;
+  const [oauthError, setOauthError] = useState("");
   const noticeTimer = useRef<number | null>(null);
 
   const dismissNotice = () => {
@@ -228,6 +248,7 @@ function App() {
     try {
       const result = await call<AccountListResponse>("list_accounts");
       setAccounts(result.accounts);
+      setWslDistribution(result.wsl_distribution ?? null);
       setCurrentTarget(result.current_target);
       setTargetAccounts(result.target_accounts ?? {});
       setSelectedAccountId((previous) => {
@@ -246,7 +267,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!showAdd || addTab !== "oauth" || oauthUrl) return;
+    if (!showAdd || addTab !== "oauth" || oauthUrl || oauthError) return;
     let cancelled = false;
     void call<string>("prepare_oauth_url")
       .then((url) => {
@@ -258,29 +279,22 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [addTab, oauthUrl, showAdd]);
+  }, [addTab, oauthUrl, oauthError, showAdd]);
 
   useEffect(() => {
-    if (!showAdd || addTab !== "oauth") return;
-    let unlisten: (() => void) | undefined;
+    if (!showAdd || addTab !== "oauth" || !oauthSession) return;
     let disposed = false;
-    void listen("oauth-callback-received", () => {
-      if (oauthUrl) void completeOAuth();
-    }).then((dispose) => {
-      if (disposed) dispose();
-      else unlisten = dispose;
-    });
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
+    void call<boolean>("wait_oauth_callback", { session: oauthSession })
+      .then(ready => { if (ready && !disposed) void completeOAuth(true); })
+      .catch(error => { if (!disposed) setOauthError(`等待 Google 回调失败：${String(error)}`); });
+    return () => { disposed = true; };
   }, [addTab, oauthUrl, showAdd]);
 
   const selectedAccount = accounts.find((account) => account.id === selectedAccountId) ?? accounts[0] ?? null;
   const hasPendingAction = pending !== null;
 
   const closeAdd = () => {
-    void call<void>("cancel_oauth_login").catch(() => undefined);
+    if (oauthSession) void call<void>("cancel_oauth_login", { session: oauthSession }).catch(() => undefined);
     setShowAdd(false);
     setOauthUrl("");
     setManualOAuthCode("");
@@ -289,12 +303,14 @@ function App() {
 
   const openAdd = () => {
     setAddTab("oauth");
+    setOauthError("");
     setShowAdd(true);
   };
 
   const changeAddTab = (tab: AddAccountTab) => {
+    if (oauthCompletionInFlight.current) return;
     if (addTab === "oauth" && tab !== "oauth") {
-      void call<void>("cancel_oauth_login").catch(() => undefined);
+      if (oauthSession) void call<void>("cancel_oauth_login", { session: oauthSession }).catch(() => undefined);
       setOauthUrl("");
       setManualOAuthCode("");
     }
@@ -336,6 +352,7 @@ function App() {
   };
 
   const startOAuth = async () => {
+    setOauthError("");
     setPending("add:oauth:start");
     showAddMessage("正在打开默认浏览器，请完成 Google 授权…");
     try {
@@ -347,18 +364,36 @@ function App() {
     }
   };
 
-  const completeOAuth = async () => {
-    if (oauthCompletionInFlight.current) return;
+  const completeOAuth = async (silent = false) => {
+    if (!oauthSession) return;
+    if (oauthCompletionInFlight.current) {
+      oauthCallbackPending.current = true;
+      return;
+    }
     oauthCompletionInFlight.current = true;
     setPending("add:oauth:complete");
-    showAddMessage("正在保存已授权账号…");
+
     try {
-      const account = await call<Account>("complete_oauth_login");
+      let account: Account | null;
+      do {
+        oauthCallbackPending.current = false;
+        account = await call<Account | null>("complete_oauth_login", { session: oauthSession });
+      } while (!account && oauthCallbackPending.current);
+      if (!account) {
+        if (!silent) showAddMessage("正在等待当前链接的 Google 回调。");
+        return;
+      }
       setNotice({ type: "success", text: `已添加 ${account.email}。` });
-      await refresh();
+      setAccounts(previous => [account, ...previous.filter(item => item.id !== account.id)]);
+      setSelectedAccountId(account.id);
       closeAdd();
+      void call<Account>("fetch_account_quota", { accountId: account.id })
+        .then(updated => setAccounts(previous => previous.map(item => item.id === updated.id ? updated : item)))
+        .catch(() => { /* Quota can be refreshed independently from the account list. */ });
     } catch (error) {
-      showAddMessage(`OAuth 授权失败：${String(error)}`, "error");
+      setOauthError(`OAuth 授权失败：${String(error)}`);
+      setOauthUrl("");
+      setManualOAuthCode("");
     } finally {
       oauthCompletionInFlight.current = false;
       setPending(null);
@@ -369,7 +404,7 @@ function App() {
     if (!manualOAuthCode.trim()) return;
     setPending("add:oauth:manual");
     try {
-      await call<void>("submit_oauth_code", { codeOrCallbackUrl: manualOAuthCode.trim() });
+      await call<void>("submit_oauth_code", { session: oauthSession, codeOrCallbackUrl: manualOAuthCode.trim() });
       await completeOAuth();
     } catch (error) {
       showAddMessage(`提交授权码失败：${String(error)}`, "error");
@@ -492,15 +527,20 @@ function App() {
     setPending(key);
     try {
       const updated = await call<Account>("fetch_account_quota", { accountId: account.id });
-      const summary = updated.quota?.is_forbidden
-        ? "该账号当前无权读取模型配额。"
-        : `已刷新 ${updated.quota?.models.length ?? 0} 个模型的配额。`;
-      setNotice({ type: "success", text: summary });
+      const forbidden = !!updated.quota?.is_forbidden;
+      setQuotaIssues(previous => {
+        const next = { ...previous };
+        if (forbidden) next[account.id] = null;
+        else delete next[account.id];
+        return next;
+      });
+      setNotice({ type: forbidden ? "info" : "success", text: forbidden ? t(lang, "quotaForbidden") : t(lang, "quotaRefreshed", { count: updated.quota?.models.length ?? 0 }) });
       await refresh();
     } catch (error) {
       const message = String(error);
       if (/invalid_(grant|client|request)/i.test(message)) openAdd();
-      setNotice({ type: "error", text: `刷新模型配额失败：${message}` });
+      setQuotaIssues(previous => ({ ...previous, [account.id]: message }));
+      setNotice({ type: "error", text: message });
     } finally {
       setPending(null);
     }
@@ -509,10 +549,11 @@ function App() {
   const refreshAllQuotas = async () => {
     setPending("quota:all");
     try {
-      const result = await call<{ refreshed: number; failed: number }>("refresh_all_quotas");
+      const result = await call<{ refreshed: number; forbidden: string[]; failed: [string, string][] }>("refresh_all_quotas");
+      setQuotaIssues(Object.fromEntries([...result.forbidden.map(id => [id, null]), ...result.failed]));
       setNotice({
-        type: result.failed ? "error" : "success",
-        text: t(lang, "refreshAllQuotasResult", { refreshed: result.refreshed, failed: result.failed }),
+        type: result.failed.length ? "error" : result.forbidden.length ? "info" : "success",
+        text: t(lang, "refreshAllQuotasResult", { refreshed: result.refreshed, forbidden: result.forbidden.length, failed: result.failed.length }),
       });
       await refresh();
     } catch (error) {
@@ -546,6 +587,7 @@ function App() {
             <div className="brand-title-row">
               <h1>{t(lang, "appTitle")}</h1>
               {appVersion && <span className="app-version" title="应用版本">v{appVersion}</span>}
+              <span className="app-author">{t(lang, "authorCredit")}</span>
             </div>
           </div>
         </div>
@@ -651,7 +693,7 @@ function App() {
                 {pending === key ? <LoaderCircle className="spin" size={18} /> : <TargetIcon size={18} />}
                 <span>
                   <strong>{targetLabels[target]}</strong>
-                  <small>{isRecordedTarget ? t(lang, "lastSwitchedTo", { target: "" }).replace("：", "") : descriptions[target]}</small>
+                  <small>{target === "wsl_cli" && wslDistribution && <b className="distribution-name">{wslDistribution}</b>}{isRecordedTarget ? t(lang, "lastSwitchedTo", { target: "" }).replace("：", "") : descriptions[target]}</small>
                 </span>
               </button>
             );
@@ -695,6 +737,12 @@ function App() {
             </button>
           </div>
 
+          {accounts.filter(account => account.id in quotaIssues).map(account => (
+            <div className="quota-issue" key={account.id}>
+              <div><strong>{account.email}</strong><p>{quotaIssues[account.id] ?? t(lang, "quotaForbidden")}</p></div>
+              {quotaIssues[account.id] !== null && <button className="quiet-button" disabled={hasPendingAction} onClick={() => void refreshQuota(account)}>{t(lang, "retryQuota")}</button>}
+            </div>
+          ))}
           {loading ? (
             <div className="empty-state"><LoaderCircle className="spin" size={22} /> {t(lang, "validatingAccounts")}</div>
           ) : accounts.length === 0 ? (
@@ -795,16 +843,7 @@ function App() {
                 </p>
                 <div className="quota-list">
                   {visibleModels.map((model) => (
-                    <div className="model-quota" key={model.name}>
-                      <div className="model-quota-title">
-                        <strong title={model.name}>{model.display_name || model.name}</strong>
-                        <span>{model.percentage}%</span>
-                      </div>
-                      <div className="quota-track" aria-label={`${model.display_name || model.name} 剩余 ${model.percentage}%`}>
-                        <i style={{ width: `${model.percentage}%` }} />
-                      </div>
-                      <small>{t(lang, "reset", { time: formatResetTimeI18n(model.reset_time, lang) })}</small>
-                    </div>
+                    <ModelQuotaRow key={model.name} model={model} lang={lang} />
                   ))}
                 </div>
                 {hasMoreModels && (
@@ -831,7 +870,7 @@ function App() {
           className="modal-layer"
           role="presentation"
           onClick={(event) => {
-            if (event.target === event.currentTarget) closeAdd();
+            if (event.target === event.currentTarget && !oauthCompletionInFlight.current) closeAdd();
           }}
         >
           <div className="add-modal" role="dialog" aria-modal="true" aria-label={t(lang, "addAccountModalHeading")}>
@@ -841,7 +880,7 @@ function App() {
                 <h2>{t(lang, "addAccountModalHeading")}</h2>
                 <p>{t(lang, "addAccountModalDesc")}</p>
               </div>
-              <button type="button" className="quiet-icon-button" onClick={closeAdd} title={t(lang, "close")}><X size={18} /></button>
+              <button type="button" className="quiet-icon-button" disabled={pending === "add:oauth:complete"} onClick={closeAdd} title={t(lang, "close")}><X size={18} /></button>
             </div>
 
             <div className="add-tabs" role="tablist" aria-label={t(lang, "addAccountTabs")}>
@@ -855,6 +894,8 @@ function App() {
                 <div className="oauth-icon"><Globe size={28} /></div>
                 <h3>{t(lang, "oauthHeading")}</h3>
                 <p>{t(lang, "oauthDesc")}</p>
+                {oauthError && <p role="alert">{oauthError}</p>}
+                {pending === "add:oauth:complete" && <p role="status">{t(lang, "oauthSaving")}</p>}
                 <button className="primary-button full-button" disabled={hasPendingAction} onClick={() => void startOAuth()}>
                   {pending === "add:oauth:start" ? <LoaderCircle className="spin" size={16} /> : <Globe size={16} />} {t(lang, "startOAuth")}
                 </button>
@@ -960,16 +1001,7 @@ function App() {
 
             <div className="quota-modal-list">
               {selectedAccount.quota.models.map((model) => (
-                <div className="model-quota" key={model.name}>
-                  <div className="model-quota-title">
-                    <strong title={model.name}>{model.display_name || model.name}</strong>
-                    <span>{model.percentage}%</span>
-                  </div>
-                  <div className="quota-track" aria-label={`${model.display_name || model.name} 剩余 ${model.percentage}%`}>
-                    <i style={{ width: `${model.percentage}%` }} />
-                  </div>
-                  <small>{t(lang, "reset", { time: formatResetTimeI18n(model.reset_time, lang) })}</small>
-                </div>
+                <ModelQuotaRow key={model.name} model={model} lang={lang} />
               ))}
             </div>
 

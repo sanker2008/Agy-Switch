@@ -2,7 +2,7 @@
 name = "agy-switch"
 version = "0.1.5"
 description = "A focused Antigravity account switcher"
-authors = ["san"]
+authors = ["San"]
 edition = "2021"
 
 [lib]
@@ -26,8 +26,11 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 base64 = "0.22"
 sha2 = "0.10"
 sysinfo = "0.31"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "process", "time"] }
 url = "2"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
 
 [features]
 default = ["custom-protocol"]

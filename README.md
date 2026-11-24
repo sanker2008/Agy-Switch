@@ -25,7 +25,7 @@
 
 ## 使用方式
 
-1. 官方发布的安装包已包含构建期注入的 Google OAuth Client ID，无需额外配置。点击“添加账号”，默认选择 **OAuth 授权**。点击“开始 OAuth 授权”后，浏览器会打开 Google 登录页；授权完成后返回应用点击“我已授权，继续”。
+1. 官方发布的安装包已包含构建期注入的 Google OAuth Client ID。客户端的额外要求见下方「Google OAuth 配置」。点击“添加账号”，默认选择 **OAuth 授权**。点击“开始 OAuth 授权”后，浏览器会打开 Google 登录页；授权完成后返回应用点击“我已授权，继续”。
 2. 如已有 token，切换至 **Refresh Token**，可粘贴单个 token、含 `refresh_token` 的 JSON 数组，或任意包含多个 token 的文本。
 3. 如目标程序已经登录，切换至 **从数据库导入**，点击 **自动导入当前登录账号** 会优先读取正在运行的实例；未运行时会选择最近更新的 Antigravity 或 Antigravity IDE 状态库。也可指定 Antigravity、Antigravity IDE，或手动选择 `state.vscdb`；还可扫描 `~/.antigravity-agent` 批量导入 V1 备份。
 4. 选中账号后，直接点击 Antigravity、Antigravity IDE 或 Antigravity CLI 即可切换；界面会显示上次成功切换的目标。
@@ -33,6 +33,10 @@
 6. 点击工具栏“导出备份”保存本地账号；在“添加账号 → 导入账号”中可导入 Agy Switch 备份或 V1 备份。
 
 模型配额直接使用账号的短期 access token 查询 Antigravity Cloud Code 服务；access token 即将过期时会先用本地保存的 refresh token 更新。Windows 上会兼容系统代理和 PAC 返回的 HTTP/HTTPS/SOCKS5 代理；若系统代理连接或超时失败，会自动重试一次直连请求，以便由全局 TUN 接管。查询失败不会删除账号或原有的配额缓存。账号无权访问配额时，界面会明确显示“无权读取”。
+
+WSL CLI 按钮会显示检测到的默认发行版。后台检查只探测正在运行的默认发行版，单次探测限时 2 秒。主动切换允许发行版启动，写入限时 15 秒。若提示超时，请刷新并确认实际账号。
+
+配额显示区分未知值与 0%。仅返回重置时间时按 0% 处理，账号平均值只统计已知比例。批量刷新会分别统计已更新、无权读取和失败账号，失败项可单独重试。
 
 ## 添加账号的数据来源
 
@@ -52,24 +56,25 @@ npm run tauri dev
 
 ### Google OAuth 配置
 
-官方发布包在 CI 构建期将公开的 Google OAuth **Client ID** 写入安装包；普通用户下载安装后不需要设置环境变量，即可完成 OAuth 登录、授权码换 token、refresh token 刷新、账号验证和模型配额查询。Client ID 是公开标识，不是 Client Secret。
+发布构建使用 Agy Switch 自己的 Google 桌面 OAuth Client ID 和配套 Client Secret。两者随桌面程序分发，可从安装包中提取。请仅使用 Google Cloud 中类型为「桌面应用」的客户端。
 
 运行期的 `AGY_GOOGLE_OAUTH_CLIENT_ID` 优先级更高，可用于开发、测试或企业自有 OAuth 客户端覆盖。复制 `.env.example` 的变量名，在启动应用的同一个终端中设置：
 
 ```powershell
 $env:AGY_GOOGLE_OAUTH_CLIENT_ID = "你的客户端 ID"
-# 仅当自有客户端明确要求时才在本机进程中设置；官方安装包不包含它：
-$env:AGY_GOOGLE_OAUTH_CLIENT_SECRET = "你的客户端 Secret"
+# 仅当自有客户端明确要求时才在本机进程中设置：
+$env:AGY_GOOGLE_OAUTH_CLIENT_SECRET = [System.Net.NetworkCredential]::new("", (Read-Host "Client Secret" -AsSecureString)).Password
 npm run tauri dev
 ```
 
-发布工作流只从 GitHub Actions 的 `AGY_GOOGLE_OAUTH_CLIENT_ID` 读取该公开标识，并在其缺失时中止构建，避免发布不可用安装包。工作流和安装包均不接收、保存或内置 Client Secret。桌面 OAuth 使用 PKCE；普通用户不需要、也不应拥有 Client Secret。不要把真实 secret 写入 `.env.example`、源代码、构建日志或公开仓库。
+发布工作流从 GitHub Actions Secrets 读取 `AGY_GOOGLE_OAUTH_CLIENT_ID` 和 `AGY_GOOGLE_OAUTH_CLIENT_SECRET`。桌面授权继续使用 PKCE。
 
 构建安装包：
 
 ```powershell
 # 本地构建可分发安装包时，需提供构建期注入的公开 Client ID：
-$env:AGY_BUNDLED_GOOGLE_OAUTH_CLIENT_ID = "你的客户端 ID"
+$env:AGY_BUNDLED_GOOGLE_OAUTH_CLIENT_ID = "你的桌面客户端 ID"
+$env:AGY_BUNDLED_GOOGLE_OAUTH_CLIENT_SECRET = [System.Net.NetworkCredential]::new("", (Read-Host "Desktop Client Secret" -AsSecureString)).Password
 npm run tauri build
 ```
 

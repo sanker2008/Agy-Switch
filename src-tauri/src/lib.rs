@@ -12,7 +12,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use sysinfo::{ProcessesToUpdate, System};
-use tauri::Emitter;
 use tauri_plugin_dialog::DialogExt;
 use tauri_plugin_opener::OpenerExt;
 use tokio::{
@@ -29,10 +28,11 @@ const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v2/userinfo";
 const GOOGLE_AUTH_URL: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const TOKEN_REFRESH_SKEW_SECONDS: i64 = 900;
-// Set only by the release build environment. A Google OAuth desktop client ID is public
-// metadata; a client secret must never be embedded in a desktop application.
+// Google installed-app credentials shipped with the binary are recoverable by recipients.
 const BUNDLED_GOOGLE_OAUTH_CLIENT_ID: Option<&str> =
     option_env!("AGY_BUNDLED_GOOGLE_OAUTH_CLIENT_ID");
+const BUNDLED_GOOGLE_OAUTH_CLIENT_SECRET: Option<&str> =
+    option_env!("AGY_BUNDLED_GOOGLE_OAUTH_CLIENT_SECRET");
 #[cfg(target_os = "windows")]
 const PROTECTED_STORE_FORMAT: &str = "agy-switch.dpapi.v1";
 const CLOUD_CODE_LOAD_ASSIST_URL: &str =
@@ -59,6 +59,7 @@ fn oauth_client_from_values(
     runtime_id: Option<String>,
     bundled_id: Option<&str>,
     secret: Option<String>,
+    bundled_secret: Option<&str>,
 ) -> Result<GoogleOAuthClient, String> {
     let id = runtime_id
         .as_deref()
@@ -76,6 +77,12 @@ fn oauth_client_from_values(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
+        .or_else(|| {
+            bundled_secret
+                .filter(|_| bundled_id.map(str::trim) == Some(id.as_str()))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
         .map(str::to_owned);
     Ok(GoogleOAuthClient { id, secret })
 }
@@ -85,6 +92,7 @@ fn google_oauth_client() -> Result<GoogleOAuthClient, String> {
         env::var("AGY_GOOGLE_OAUTH_CLIENT_ID").ok(),
         BUNDLED_GOOGLE_OAUTH_CLIENT_ID,
         env::var("AGY_GOOGLE_OAUTH_CLIENT_SECRET").ok(),
+        BUNDLED_GOOGLE_OAUTH_CLIENT_SECRET,
     )
 }
 
@@ -176,6 +184,7 @@ struct AccountView {
 
 #[derive(Debug, Serialize)]
 struct AccountListResponse {
+    wsl_distribution: Option<String>,
     accounts: Vec<AccountView>,
     current_target: Option<SwitchTarget>,
     target_accounts: HashMap<SwitchTarget, String>,
@@ -251,7 +260,7 @@ struct GoogleUserInfo {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ModelQuota {
     name: String,
-    percentage: i32,
+    percentage: Option<i32>,
     reset_time: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     display_name: Option<String>,
@@ -314,7 +323,8 @@ struct QuotaTier {
 #[derive(Debug, Serialize)]
 struct QuotaRefreshSummary {
     refreshed: usize,
-    failed: usize,
+    forbidden: Vec<String>,
+    failed: Vec<(String, String)>,
 }
 
 struct OAuthFlow {
@@ -324,7 +334,8 @@ struct OAuthFlow {
     code_verifier: String,
     cancel_tx: watch::Sender<bool>,
     code_tx: mpsc::Sender<Result<String, String>>,
-    code_rx: Option<mpsc::Receiver<Result<String, String>>>,
+    ready_tx: watch::Sender<bool>,
+    code_rx: mpsc::Receiver<Result<String, String>>,
 }
 
 struct DatabaseToken {
@@ -841,11 +852,11 @@ fn pkce_challenge(code_verifier: &str) -> String {
 }
 
 fn build_oauth_authorization_url(
+    client_id: &str,
     redirect_uri: &str,
     state: &str,
     code_challenge: &str,
 ) -> Result<String, String> {
-    let oauth_client = google_oauth_client()?;
     let scopes = [
         "openid",
         "https://www.googleapis.com/auth/cloud-platform",
@@ -858,7 +869,7 @@ fn build_oauth_authorization_url(
     Url::parse_with_params(
         GOOGLE_AUTH_URL,
         [
-            ("client_id", oauth_client.id.as_str()),
+            ("client_id", client_id),
             ("redirect_uri", redirect_uri),
             ("response_type", "code"),
             ("scope", &scopes),
@@ -877,7 +888,7 @@ fn build_oauth_authorization_url(
 fn oauth_success_html() -> &'static str {
     "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
     <html><body style='font-family:system-ui;text-align:center;padding:48px'>\
-    <h1 style='color:#1d6931'>授权成功</h1><p>可以关闭此页面并返回 Agy Switch。</p>\
+    <h1 style='color:#1d6931'>已收到 Google 回调</h1><p>请返回 Agy Switch 查看账号保存结果。</p>\
     <script>setTimeout(function(){window.close()},1500)</script></body></html>"
 }
 
@@ -887,19 +898,17 @@ fn oauth_failure_html() -> &'static str {
     <h1 style='color:#b4232b'>授权未完成</h1><p>请返回 Agy Switch 后重试。</p></body></html>"
 }
 
-async fn prepare_oauth_flow(app: tauri::AppHandle) -> Result<String, String> {
+async fn prepare_oauth_flow() -> Result<String, String> {
+    static PREPARE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _prepare = PREPARE_LOCK.lock().await;
     {
         let state = oauth_flow_state()
             .lock()
             .map_err(|_| "OAuth 状态锁不可用")?;
         if let Some(flow) = state.as_ref() {
-            if flow.code_rx.is_some() {
-                return Ok(flow.authorization_url.clone());
-            }
+            return Ok(flow.authorization_url.clone());
         }
     }
-    cancel_oauth_flow();
-
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .map_err(|error| format!("无法创建 OAuth 本机回调端口：{error}"))?;
@@ -910,13 +919,18 @@ async fn prepare_oauth_flow(app: tauri::AppHandle) -> Result<String, String> {
     let redirect_uri = format!("http://127.0.0.1:{port}/oauth-callback");
     let state = Uuid::new_v4().to_string();
     let code_verifier = new_pkce_verifier();
-    let authorization_url =
-        build_oauth_authorization_url(&redirect_uri, &state, &pkce_challenge(&code_verifier))?;
+    let authorization_url = build_oauth_authorization_url(
+        &google_oauth_client()?.id,
+        &redirect_uri,
+        &state,
+        &pkce_challenge(&code_verifier),
+    )?;
     let (cancel_tx, mut cancel_rx) = watch::channel(false);
     let (code_tx, code_rx) = mpsc::channel::<Result<String, String>>(1);
     let callback_tx = code_tx.clone();
     let callback_state = state.clone();
-    let callback_app = app.clone();
+    let (ready_tx, _) = watch::channel(false);
+    let callback_ready = ready_tx.clone();
 
     tokio::spawn(async move {
         loop {
@@ -946,23 +960,27 @@ async fn prepare_oauth_flow(app: tauri::AppHandle) -> Result<String, String> {
                     .find(|(key, _)| key == "state")
                     .map(|(_, value)| value.into_owned())
             });
-            let is_valid = returned_state.as_deref() == Some(callback_state.as_str());
-            let result = match (code, is_valid) {
-                (Some(code), true) => Ok(code),
-                (Some(_), false) => Err("OAuth state 不匹配，已拒绝本次授权。".to_string()),
-                (None, _) => {
-                    Err("Google 未返回授权码；请在 Agy Switch 中重新开始授权。".to_string())
-                }
-            };
-            let response = if result.is_ok() {
+            if callback_url.as_ref().map(Url::path) != Some("/oauth-callback")
+                || returned_state.as_deref() != Some(callback_state.as_str())
+            {
+                let _ = stream.write_all(oauth_failure_html().as_bytes()).await;
+                continue;
+            }
+            let result = code
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "Google 未返回授权码；请重新开始授权。".to_string());
+            let has_code = result.is_ok();
+            let queued = callback_tx.try_send(result).is_ok();
+            if queued {
+                callback_ready.send_replace(true);
+            }
+            let response = if queued && has_code {
                 oauth_success_html()
             } else {
                 oauth_failure_html()
             };
             let _ = stream.write_all(response.as_bytes()).await;
             let _ = stream.flush().await;
-            let _ = callback_app.emit("oauth-callback-received", ());
-            let _ = callback_tx.send(result).await;
             break;
         }
     });
@@ -977,17 +995,37 @@ async fn prepare_oauth_flow(app: tauri::AppHandle) -> Result<String, String> {
         code_verifier,
         cancel_tx,
         code_tx,
-        code_rx: Some(code_rx),
+        ready_tx,
+        code_rx,
     });
     Ok(authorization_url)
 }
 
-fn cancel_oauth_flow() {
+fn cancel_oauth_flow(session: &str) {
     if let Ok(mut state) = oauth_flow_state().lock() {
-        if let Some(flow) = state.take() {
+        if state.as_ref().is_some_and(|flow| flow.state == session) {
+            let flow = state.take().unwrap();
             let _ = flow.cancel_tx.send(true);
         }
     }
+}
+
+fn oauth_exchange_error(status: reqwest::StatusCode, body: &str) -> String {
+    let data = serde_json::from_str::<serde_json::Value>(body).unwrap_or_default();
+    let description = data["error_description"]
+        .as_str()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let reason = match data["error"].as_str() {
+        Some("invalid_request") if description.contains("client_secret") && description.contains("missing") =>
+            "Google 要求当前客户端提供 Client Secret（invalid_request）。请配置同一客户端的 AGY_GOOGLE_OAUTH_CLIENT_SECRET 并重启应用。",
+        Some("invalid_client") => "Google 拒绝当前客户端凭据（invalid_client）。请核对 Client ID 与 Client Secret 是否属于同一个客户端。",
+        Some("invalid_grant") => "授权码已失效、已使用或与当前授权请求不匹配（invalid_grant）。请重新开始授权。",
+        Some("redirect_uri_mismatch") => "Google 拒绝了回调地址（redirect_uri_mismatch）。请核对 OAuth 客户端类型与回调配置。",
+        Some("invalid_request") => "Google 拒绝了授权码交换请求（invalid_request）。",
+        _ => "Google 未接受本次授权码交换请求。",
+    };
+    format!("OAuth 授权码换取 Token 失败（HTTP {status}）：{reason}")
 }
 
 async fn exchange_oauth_code(
@@ -1014,7 +1052,8 @@ async fn exchange_oauth_code(
         .map_err(|error| format!("OAuth 授权码换取 Token 失败：{error}"))?;
     if !response.status().is_success() {
         let status = response.status();
-        return Err(format!("OAuth 授权码换取 Token 失败（HTTP {status}）。"));
+        let body = response.text().await.unwrap_or_default();
+        return Err(oauth_exchange_error(status, &body));
     }
     response
         .json::<GoogleTokenResponse>()
@@ -1423,9 +1462,12 @@ fn tier_name_opt(tier: Option<&QuotaTier>) -> Option<String> {
     tier.and_then(tier_name)
 }
 
-fn quota_percentage(fraction: Option<f64>) -> i32 {
-    let fraction = fraction.filter(|value| value.is_finite()).unwrap_or(0.0);
-    (fraction.clamp(0.0, 1.0) * 100.0).round() as i32
+fn quota_percentage(fraction: Option<f64>, reset: Option<&str>) -> Option<i32> {
+    match fraction {
+        Some(value) if value.is_finite() => Some((value.clamp(0.0, 1.0) * 100.0).round() as i32),
+        None if reset.is_some_and(|time| !time.trim().is_empty()) => Some(0),
+        _ => None,
+    }
 }
 
 fn is_user_facing_model(name: &str) -> bool {
@@ -1481,7 +1523,10 @@ async fn fetch_available_models(
                         let quota = model.quota_info?;
                         Some(ModelQuota {
                             name,
-                            percentage: quota_percentage(quota.remaining_fraction),
+                            percentage: quota_percentage(
+                                quota.remaining_fraction,
+                                quota.reset_time.as_deref(),
+                            ),
                             reset_time: quota.reset_time.unwrap_or_default(),
                             display_name: model.display_name,
                         })
@@ -1559,6 +1604,7 @@ async fn list_accounts() -> Result<AccountListResponse, String> {
     }
 
     Ok(AccountListResponse {
+        wsl_distribution: default_wsl_distribution(),
         accounts: store
             .accounts
             .iter()
@@ -1570,93 +1616,118 @@ async fn list_accounts() -> Result<AccountListResponse, String> {
 }
 
 #[tauri::command]
-async fn prepare_oauth_url(app: tauri::AppHandle) -> Result<String, String> {
-    prepare_oauth_flow(app).await
+async fn prepare_oauth_url() -> Result<String, String> {
+    prepare_oauth_flow().await
 }
 
 #[tauri::command]
 async fn open_oauth_browser(app: tauri::AppHandle) -> Result<(), String> {
-    let authorization_url = prepare_oauth_flow(app.clone()).await?;
+    let authorization_url = prepare_oauth_flow().await?;
     app.opener()
         .open_url(&authorization_url, None::<String>)
         .map_err(|error| format!("无法打开默认浏览器：{error}"))
 }
 
 #[tauri::command]
-async fn complete_oauth_login() -> Result<AccountView, String> {
-    let (mut code_rx, redirect_uri, code_verifier) = {
-        let mut state = oauth_flow_state()
+async fn wait_oauth_callback(session: String) -> Result<bool, String> {
+    let mut ready = {
+        let active = oauth_flow_state()
             .lock()
             .map_err(|_| "OAuth 状态锁不可用")?;
-        let flow = state
-            .as_mut()
-            .ok_or("没有进行中的 OAuth 授权；请先点击“开始 OAuth 授权”。")?;
-        let code_rx = flow
-            .code_rx
-            .take()
-            .ok_or("OAuth 授权正在处理中，请勿重复提交。")?;
-        (
-            code_rx,
-            flow.redirect_uri.clone(),
-            flow.code_verifier.clone(),
-        )
+        let Some(flow) = active.as_ref().filter(|flow| flow.state == session) else {
+            return Ok(false);
+        };
+        flow.ready_tx.subscribe()
     };
-    let code = match code_rx.recv().await {
-        Some(Ok(code)) => code,
-        Some(Err(error)) => return Err(error),
-        None => return Err("OAuth 授权已取消或回调端口已关闭。".to_string()),
+    let received = ready.wait_for(|queued| *queued).await.is_ok();
+    Ok(received)
+}
+
+#[tauri::command]
+async fn complete_oauth_login(session: String) -> Result<Option<AccountView>, String> {
+    let ready = {
+        let mut active = oauth_flow_state()
+            .lock()
+            .map_err(|_| "OAuth 状态锁不可用")?;
+        take_oauth_callback(&mut active, &session)?
     };
-    cancel_oauth_flow();
+    let Some((code, flow)) = ready else {
+        return Ok(None);
+    };
+    let redirect_uri = flow.redirect_uri;
+    let code_verifier = flow.code_verifier;
     let account = build_account_from_oauth_token(
         exchange_oauth_code(&code, &redirect_uri, &code_verifier).await?,
     )
     .await?;
-    upsert_imported_account(add_quota_if_available(account).await)
+    upsert_imported_account(account).map(Some)
+}
+
+fn take_oauth_callback(
+    active: &mut Option<OAuthFlow>,
+    session: &str,
+) -> Result<Option<(String, OAuthFlow)>, String> {
+    let Some(flow) = active.as_mut().filter(|flow| flow.state == session) else {
+        return Ok(None);
+    };
+    let result = match flow.code_rx.try_recv() {
+        Ok(result) => result,
+        Err(mpsc::error::TryRecvError::Empty) => return Ok(None),
+        Err(mpsc::error::TryRecvError::Disconnected) => {
+            Err("OAuth 回调已关闭，请重新开始授权。".into())
+        }
+    };
+    let finished = active.take().unwrap();
+    let _ = finished.cancel_tx.send(true);
+    Ok(Some((result?, finished)))
 }
 
 #[tauri::command]
-async fn submit_oauth_code(code_or_callback_url: String) -> Result<(), String> {
+async fn submit_oauth_code(code_or_callback_url: String, session: String) -> Result<(), String> {
     let input = code_or_callback_url.trim();
     if input.is_empty() {
         return Err("授权码不能为空。".to_string());
     }
-    let parsed_url = Url::parse(input).ok();
-    let code = parsed_url
+    let active = oauth_flow_state()
+        .lock()
+        .map_err(|_| "OAuth 状态锁不可用")?;
+    let flow = active
         .as_ref()
-        .and_then(|url| {
-            url.query_pairs()
-                .find(|(key, _)| key == "code")
-                .map(|(_, value)| value.into_owned())
-        })
-        .unwrap_or_else(|| input.to_string());
-    let submitted_state = parsed_url.as_ref().and_then(|url| {
-        url.query_pairs()
-            .find(|(key, _)| key == "state")
-            .map(|(_, value)| value.into_owned())
-    });
-    let sender = {
-        let state = oauth_flow_state()
-            .lock()
-            .map_err(|_| "OAuth 状态锁不可用")?;
-        let flow = state
-            .as_ref()
-            .ok_or("没有进行中的 OAuth 授权；请先点击“开始 OAuth 授权”。")?;
-        if let Some(submitted_state) = submitted_state {
-            if submitted_state != flow.state {
-                return Err("OAuth state 不匹配，已拒绝本次授权。".to_string());
-            }
+        .filter(|flow| flow.state == session)
+        .ok_or("这次授权已结束，请重新开始授权。")?;
+    let code = manual_oauth_code(input, &flow.redirect_uri, &session)?;
+    match flow.code_tx.try_send(Ok(code)) {
+        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {
+            flow.ready_tx.send_replace(true);
+            Ok(())
         }
-        flow.code_tx.clone()
+        Err(_) => Err("本次授权已关闭，请重新开始授权。".into()),
+    }
+}
+
+fn manual_oauth_code(input: &str, redirect_uri: &str, session: &str) -> Result<String, String> {
+    let Ok(url) = Url::parse(input) else {
+        return Ok(input.to_owned());
     };
-    sender
-        .send(Ok(code))
-        .await
-        .map_err(|_| "OAuth 授权码接收器已关闭；请重新开始授权。".to_string())
+    let mut base = url.clone();
+    base.set_query(None);
+    base.set_fragment(None);
+    if base.as_str() != redirect_uri
+        || !url.query_pairs().any(|(k, v)| k == "state" && v == session)
+    {
+        return Err(
+            "这条回调链接不属于当前授权窗口。请使用当前窗口复制的授权链接重新登录。".into(),
+        );
+    }
+    url.query_pairs()
+        .find(|(k, v)| k == "code" && !v.is_empty())
+        .map(|(_, v)| v.into_owned())
+        .ok_or_else(|| "回调链接中没有授权码。".into())
 }
 
 #[tauri::command]
-fn cancel_oauth_login() {
-    cancel_oauth_flow();
+fn cancel_oauth_login(session: String) {
+    cancel_oauth_flow(&session);
 }
 
 #[tauri::command]
@@ -1743,12 +1814,16 @@ async fn refresh_all_quotas() -> Result<QuotaRefreshSummary, String> {
     };
     let mut summary = QuotaRefreshSummary {
         refreshed: 0,
-        failed: 0,
+        failed: Vec::new(),
+        forbidden: Vec::new(),
     };
     for account_id in account_ids {
-        match fetch_account_quota(account_id).await {
+        match fetch_account_quota(account_id.clone()).await {
+            Ok(view) if view.quota.as_ref().is_some_and(|q| q.is_forbidden) => {
+                summary.forbidden.push(account_id)
+            }
             Ok(_) => summary.refreshed += 1,
-            Err(_) => summary.failed += 1,
+            Err(error) => summary.failed.push((account_id, error)),
         }
     }
     Ok(summary)
@@ -2023,7 +2098,15 @@ fn delete_account(account_id: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn switch_account(account_id: String, target: SwitchTarget) -> Result<String, String> {
+async fn switch_account(account_id: String, target: SwitchTarget) -> Result<String, String> {
+    static SWITCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = SWITCH_LOCK.lock().await;
+    tauri::async_runtime::spawn_blocking(move || switch_account_blocking(account_id, target))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn switch_account_blocking(account_id: String, target: SwitchTarget) -> Result<String, String> {
     let stored = {
         let _guard = STORE_LOCK.lock().map_err(|_| "账号存储锁不可用")?;
         let store = read_store()?;
@@ -2584,19 +2667,81 @@ fn executable_path(target: SwitchTarget) -> Option<PathBuf> {
 }
 
 #[cfg(any(target_os = "windows", test))]
-const WSL_CREDENTIAL_WRITE_COMMAND: &str = "umask 077; mkdir -p \"$HOME/.gemini/antigravity-cli\"; cat > \"$HOME/.gemini/antigravity-cli/credentials.json\"; chmod 600 \"$HOME/.gemini/antigravity-cli/credentials.json\"";
+const WSL_CREDENTIAL_WRITE_COMMAND: &str = r#"set -eu
+umask 077
+target="$HOME/.gemini/antigravity-cli/credentials.json"
+IFS= read -r payload
+mkdir -p "${target%/*}"
+tmp=$(mktemp "$target.XXXXXX")
+trap 'rm -f "$tmp"' EXIT
+chmod 600 "$tmp"
+printf '%s\n' "$payload" > "$tmp"
+mv -f "$tmp" "$target""#;
 #[cfg(any(target_os = "windows", test))]
 const WSL_CREDENTIAL_READ_COMMAND: &str = "if [ -r \"$HOME/.gemini/antigravity-cli/credentials.json\" ]; then cat \"$HOME/.gemini/antigravity-cli/credentials.json\"; else secret-tool lookup service gemini username antigravity; fi";
+
+#[cfg(windows)]
+fn default_wsl_distribution() -> Option<String> {
+    use winreg::{enums::HKEY_CURRENT_USER, RegKey};
+    let distributions = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(r"Software\Microsoft\Windows\CurrentVersion\Lxss")
+        .ok()?;
+    let id: String = distributions.get_value("DefaultDistribution").ok()?;
+    distributions
+        .open_subkey(id)
+        .ok()?
+        .get_value("DistributionName")
+        .ok()
+}
+
+#[cfg(not(windows))]
+fn default_wsl_distribution() -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+async fn run_wsl(
+    args: &[&str],
+    input: Option<&[u8]>,
+    seconds: u64,
+) -> Result<std::process::Output, String> {
+    use std::process::Stdio;
+    let mut command = tokio::process::Command::new("wsl.exe");
+    command
+        .args(args)
+        .kill_on_drop(true)
+        .creation_flags(0x08000000)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    tokio::time::timeout(Duration::from_secs(seconds), async {
+        let mut child = command.spawn()?;
+        if let Some(bytes) = input {
+            child
+                .stdin
+                .take()
+                .expect("piped stdin")
+                .write_all(bytes)
+                .await?;
+        }
+        child.wait_with_output().await
+    })
+    .await
+    .map_err(|_| format!("WSL 操作超过 {seconds} 秒，请检查发行版状态后重试。"))?
+    .map_err(|error| format!("WSL 操作失败：{error}"))
+}
 
 fn write_to_wsl_cli(account: &StoredAccount) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        use std::io::Write;
-
         let expiry = chrono::DateTime::from_timestamp(account.token.expires_at, 0)
             .unwrap_or_else(Utc::now)
             .to_rfc3339_opts(SecondsFormat::Micros, true);
-        let payload = serde_json::to_string_pretty(&serde_json::json!({
+        let mut payload = serde_json::to_string(&serde_json::json!({
             "token": {
                 "access_token": account.token.access_token,
                 "token_type": "Bearer",
@@ -2607,21 +2752,12 @@ fn write_to_wsl_cli(account: &StoredAccount) -> Result<(), String> {
         }))
         .map_err(|error| format!("无法序列化 WSL 凭据：{error}"))?;
 
-        let mut child = Command::new("wsl.exe")
-            .args(["--", "sh", "-c", WSL_CREDENTIAL_WRITE_COMMAND])
-            .stdin(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("无法启动默认 WSL 发行版：{error}"))?;
-        child
-            .stdin
-            .take()
-            .ok_or("无法写入默认 WSL 发行版的凭据。")?
-            .write_all(payload.as_bytes())
-            .map_err(|error| format!("无法写入默认 WSL 发行版的凭据：{error}"))?;
-        let output = child
-            .wait_with_output()
-            .map_err(|error| format!("无法等待 WSL 凭据写入完成：{error}"))?;
+        payload.push('\n');
+        let output = tauri::async_runtime::block_on(run_wsl(
+            &["--", "sh", "-c", WSL_CREDENTIAL_WRITE_COMMAND],
+            Some(payload.as_bytes()),
+            15,
+        ))?;
         if output.status.success() {
             return Ok(());
         }
@@ -2800,7 +2936,7 @@ fn write_windows_credential(payload: &str) -> Result<(), String> {
 }
 
 async fn import_account_from_keyring() -> Result<DatabaseImportResult, String> {
-    let raw_payloads = read_all_system_keyrings();
+    let raw_payloads = read_all_system_keyrings().await;
     if raw_payloads.is_empty() {
         return Err(
             "系统凭据管理器或 WSL 中未找到 Antigravity CLI 登录凭据（gemini:antigravity）。"
@@ -2878,7 +3014,7 @@ fn extract_refresh_token_from_keyring(raw_payload: &str) -> Result<String, Strin
     Err("CLI 系统凭据中未找到有效的 refresh token。".to_string())
 }
 
-fn read_all_system_keyrings() -> Vec<String> {
+async fn read_all_system_keyrings() -> Vec<String> {
     let mut results = Vec::new();
 
     #[cfg(target_os = "windows")]
@@ -2888,7 +3024,7 @@ fn read_all_system_keyrings() -> Vec<String> {
                 results.push(win_cred);
             }
         }
-        if let Ok(wsl_cred) = read_wsl_credential() {
+        if let Ok(wsl_cred) = read_wsl_credential(false).await {
             if !wsl_cred.trim().is_empty() && !results.contains(&wsl_cred) {
                 results.push(wsl_cred);
             }
@@ -2994,11 +3130,42 @@ fn read_windows_credential() -> Result<String, String> {
 }
 
 #[cfg(target_os = "windows")]
-fn read_wsl_credential() -> Result<String, String> {
-    let output = Command::new("wsl.exe")
-        .args(["--", "sh", "-c", WSL_CREDENTIAL_READ_COMMAND])
-        .output()
-        .map_err(|e| format!("WSL 无法执行 secret-tool：{e}"))?;
+async fn read_wsl_credential(only_running: bool) -> Result<String, String> {
+    let distribution = default_wsl_distribution().ok_or("找不到默认 WSL 发行版。")?;
+    if only_running {
+        let running = run_wsl(&["--list", "--running", "--quiet"], None, 2).await?;
+        let names = if running.stdout.contains(&0) {
+            let words = running
+                .stdout
+                .chunks_exact(2)
+                .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                .collect::<Vec<_>>();
+            String::from_utf16_lossy(&words)
+        } else {
+            String::from_utf8_lossy(&running.stdout).into_owned()
+        };
+        if !running.status.success()
+            || !names
+                .trim_start_matches('\u{feff}')
+                .lines()
+                .any(|line| line.trim() == distribution)
+        {
+            return Err("默认 WSL 发行版未运行。".into());
+        }
+    }
+    let output = run_wsl(
+        &[
+            "-d",
+            &distribution,
+            "--",
+            "sh",
+            "-c",
+            WSL_CREDENTIAL_READ_COMMAND,
+        ],
+        None,
+        if only_running { 2 } else { 15 },
+    )
+    .await?;
     if output.status.success() {
         let secret = String::from_utf8_lossy(&output.stdout).trim().to_string();
         if !secret.is_empty() {
@@ -3086,7 +3253,7 @@ async fn detect_system_active_accounts(store: &AccountStore) -> HashMap<SwitchTa
     // 4. Detect WSL CLI active account
     #[cfg(target_os = "windows")]
     {
-        if let Ok(raw_cred) = read_wsl_credential() {
+        if let Ok(raw_cred) = read_wsl_credential(true).await {
             if let Ok(rt) = extract_refresh_token_from_keyring(&raw_cred) {
                 if let Some(account) = store
                     .accounts
@@ -3308,6 +3475,105 @@ fn remove_unified_topic_entry(data: &[u8], target_key: &str) -> Result<Vec<u8>, 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exchange_failure_explains_missing_secret_without_echoing_response_values() {
+        let status = reqwest::StatusCode::BAD_REQUEST;
+        let err = super::oauth_exchange_error(
+            status,
+            r#"{"error":"invalid_request","error_description":"client_secret is missing","code":"private-marker"}"#,
+        );
+        assert!(err.contains("AGY_GOOGLE_OAUTH_CLIENT_SECRET"));
+        assert!(!err.contains("private-marker"));
+        assert!(
+            super::oauth_exchange_error(status, r#"{"error":"invalid_grant"}"#)
+                .contains("授权码已失效")
+        );
+        assert!(!super::oauth_exchange_error(status, "private-marker").contains("private-marker"));
+    }
+
+    #[test]
+    fn pasted_callback_requires_current_redirect_and_state() {
+        let redirect = "http://127.0.0.1:55555/oauth-callback";
+        for query in ["code=test", "code=test&state=old", "state=current"] {
+            assert!(
+                super::manual_oauth_code(&format!("{redirect}?{query}"), redirect, "current")
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            super::manual_oauth_code(
+                &format!("{redirect}?code=test&state=current"),
+                redirect,
+                "current"
+            )
+            .unwrap(),
+            "test"
+        );
+        assert!(super::manual_oauth_code(
+            "http://127.0.0.1:44444/oauth-callback?code=test&state=current",
+            redirect,
+            "current"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn copied_link_callback_is_consumed_once_by_its_own_session() {
+        let (code_tx, code_rx) = super::mpsc::channel(1);
+        let (cancel_tx, _cancel_rx) = super::watch::channel(false);
+        let mut active = Some(super::OAuthFlow {
+            authorization_url: String::new(),
+            redirect_uri: String::new(),
+            state: "current".into(),
+            code_verifier: String::new(),
+            cancel_tx,
+            ready_tx: super::watch::channel(false).0,
+            code_tx: code_tx.clone(),
+            code_rx,
+        });
+        assert!(super::take_oauth_callback(&mut active, "current")
+            .unwrap()
+            .is_none());
+        code_tx.try_send(Ok("sample-code".into())).unwrap();
+        assert!(super::take_oauth_callback(&mut active, "old")
+            .unwrap()
+            .is_none());
+        let (code, _) = super::take_oauth_callback(&mut active, "current")
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, "sample-code");
+        assert!(super::take_oauth_callback(&mut active, "current")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn quota_distinguishes_missing_and_exhausted() {
+        assert_eq!(super::quota_percentage(None, None), None);
+        assert_eq!(super::quota_percentage(None, Some(" ")), None);
+        assert_eq!(super::quota_percentage(None, Some("2026-11-25")), Some(0));
+        assert_eq!(super::quota_percentage(Some(0.42), None), Some(42));
+        assert_eq!(super::quota_percentage(Some(0.0), None), Some(0));
+    }
+
+    #[test]
+    fn authorization_url_excludes_rejected_aicode_scope_and_uses_pkce() {
+        let url = super::build_oauth_authorization_url(
+            "test-client",
+            "http://localhost",
+            "state",
+            "challenge",
+        )
+        .unwrap();
+        let url = url::Url::parse(&url).unwrap();
+        let params: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert!(params["scope"].split_whitespace().any(|s| s == "openid"));
+        assert!(!params["scope"]
+            .split_whitespace()
+            .any(|s| s == "https://www.googleapis.com/auth/aicode"));
+        assert_eq!(params["code_challenge_method"], "S256");
+    }
+
     use super::{
         apply_refreshed_token, backup_db, database_import_outcome, google_token_error,
         is_oauth_config_key, oauth_client_from_values, pkce_challenge,
@@ -3428,7 +3694,7 @@ mod tests {
     #[test]
     fn retries_directly_only_after_a_system_proxy_connection_failure() {
         assert!(should_retry_google_request_directly(true, true));
-        assert!(should_retry_google_request_directly(true, false));
+        assert!(!should_retry_google_request_directly(true, false));
         assert!(!should_retry_google_request_directly(false, true));
         assert!(!should_retry_google_request_directly(false, false));
     }
@@ -3443,17 +3709,19 @@ mod tests {
 
     #[test]
     fn oauth_prefers_runtime_client_id_then_uses_bundled_id() {
-        assert!(oauth_client_from_values(None, None, None).is_err());
+        assert!(oauth_client_from_values(None, None, None, None).is_err());
 
-        let bundled = oauth_client_from_values(None, Some("bundled-client-id"), None)
-            .expect("a bundled installed-app client id should be sufficient for PKCE");
+        let bundled =
+            oauth_client_from_values(None, Some("bundled-client-id"), None, Some("fixture"))
+                .expect("a bundled installed-app client id should be sufficient for PKCE");
         assert_eq!(bundled.id, "bundled-client-id");
-        assert_eq!(bundled.secret, None);
+        assert_eq!(bundled.secret.as_deref(), Some("fixture"));
 
         let runtime = oauth_client_from_values(
             Some("runtime-client-id".to_string()),
             Some("bundled-client-id"),
             None,
+            Some("fixture"),
         )
         .expect("a runtime client id should override the bundled client id");
         assert_eq!(runtime.id, "runtime-client-id");
@@ -3463,6 +3731,7 @@ mod tests {
             Some("custom-client-id".to_string()),
             None,
             Some("custom-client-secret".to_string()),
+            None,
         )
         .expect("a custom runtime client may still provide an optional secret");
         assert_eq!(custom_secret.id, "custom-client-id");
@@ -3690,6 +3959,7 @@ pub fn run() {
             list_accounts,
             prepare_oauth_url,
             open_oauth_browser,
+            wait_oauth_callback,
             complete_oauth_login,
             submit_oauth_code,
             cancel_oauth_login,
