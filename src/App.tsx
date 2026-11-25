@@ -62,6 +62,7 @@ interface QuotaData {
   last_updated: number;
   subscription_tier: string | null;
   is_forbidden: boolean;
+  forbidden_reason?: string;
 }
 
 interface AccountListResponse {
@@ -214,6 +215,7 @@ function App() {
   const oauthCallbackPending = useRef(false);
   const oauthSession = oauthUrl ? new URL(oauthUrl).searchParams.get("state") : null;
   const [oauthError, setOauthError] = useState("");
+  const [databaseImportError, setDatabaseImportError] = useState("");
   const noticeTimer = useRef<number | null>(null);
 
   const dismissNotice = () => {
@@ -304,6 +306,7 @@ function App() {
   const openAdd = () => {
     setAddTab("oauth");
     setOauthError("");
+    setDatabaseImportError("");
     setShowAdd(true);
   };
 
@@ -426,7 +429,7 @@ function App() {
     payload: Record<string, unknown>,
   ) => {
     setPending("add:database");
-    showAddMessage(t(lang, "validatingAccounts"));
+    setDatabaseImportError("");
     try {
       const result = await call<DatabaseImportResult>(command, payload);
       const text = result.outcome === "added"
@@ -438,7 +441,7 @@ function App() {
       await refresh();
       closeAdd();
     } catch (error) {
-      showAddMessage(`数据库导入失败：${String(error)}`, "error");
+      setDatabaseImportError(String(error));
     } finally {
       setPending(null);
     }
@@ -744,7 +747,7 @@ function App() {
             </div>
           ))}
           {loading ? (
-            <div className="empty-state"><LoaderCircle className="spin" size={22} /> {t(lang, "validatingAccounts")}</div>
+            <div className="empty-state"><LoaderCircle className="spin" size={22} /> {t(lang, "loadingAccounts")}</div>
           ) : accounts.length === 0 ? (
             <div className="empty-state">
               <KeyRound size={24} />
@@ -810,7 +813,7 @@ function App() {
           ) : !selectedAccount.quota ? (
             <div className="quota-empty"><p>{t(lang, "quotaEmptyNotQueried")}</p><span>{t(lang, "quotaEmptyClickRefresh")}</span></div>
           ) : selectedAccount.quota.is_forbidden ? (
-            <div className="quota-empty"><CircleAlert size={18} /><p>{t(lang, "quotaEmptyForbidden")}</p></div>
+            <div className="quota-empty"><CircleAlert size={18} /><p>{t(lang, "quotaEmptyForbidden")} (HTTP 403{selectedAccount.quota.forbidden_reason && ` · ${selectedAccount.quota.forbidden_reason}`})</p></div>
           ) : selectedAccount.quota.models.length === 0 ? (
             <div className="quota-empty"><p>{t(lang, "quotaEmptyNoModels")}</p></div>
           ) : (() => {
@@ -941,6 +944,18 @@ function App() {
                   <button className="quiet-button" disabled={hasPendingAction} onClick={() => void importDatabase("import_default_database", { target: "cli" })}><Terminal size={16} /> Antigravity CLI</button>
                   <button className="quiet-button" disabled={hasPendingAction} onClick={() => void chooseDatabaseFile()}><Database size={16} /> {t(lang, "chooseDbFile")}</button>
                 </div>
+                {pending === "add:database" && (
+                  <p role="status"><LoaderCircle className="spin" size={14} /> {t(lang, "validatingAccounts")}</p>
+                )}
+                {databaseImportError && (
+                  <div role="alert" className="import-scheme">
+                    <strong>{t(lang, "dbImportFailed")}</strong>
+                    <p>{databaseImportError}</p>
+                    {/unauthorized_client|invalid_client|invalid_grant/.test(databaseImportError) && (
+                      <button className="quiet-button" onClick={() => changeAddTab("oauth")}>{t(lang, "tabOAuth")}</button>
+                    )}
+                  </div>
+                )}
                 <div className="import-divider"><span>{t(lang, "restoreDivider")}</span></div>
                 <div className="import-scheme">
                   <h3><Upload size={16} /> {t(lang, "agyBackupHeading")}</h3>

@@ -274,6 +274,8 @@ struct QuotaData {
     subscription_tier: Option<String>,
     #[serde(default)]
     is_forbidden: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    forbidden_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1538,6 +1540,7 @@ async fn fetch_available_models(
                     last_updated: now_timestamp(),
                     subscription_tier,
                     is_forbidden: false,
+                    forbidden_reason: None,
                 });
             }
 
@@ -1550,11 +1553,35 @@ async fn fetch_available_models(
                 continue;
             }
             if status == reqwest::StatusCode::FORBIDDEN {
+                let body = response.json::<serde_json::Value>().await.ok();
+                let error = body.as_ref().and_then(|body| body.get("error"));
+                let info = error
+                    .and_then(|e| e.get("details"))
+                    .and_then(|details| details.as_array())
+                    .and_then(|details| details.iter().find(|d| d.get("reason").is_some()));
+                let reason = info.and_then(|d| d.get("reason")?.as_str())
+                    .or_else(|| error.and_then(|e| e.get("status")?.as_str()))
+                    .filter(|s| !s.is_empty() && s.len() <= 100 && s.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'));
+                let detail = reason.map(|code| {
+                    let mut parts = vec![code];
+                    if let Some(service) = info.and_then(|d| d.pointer("/metadata/service")?.as_str()) {
+                        if service.ends_with(".googleapis.com") && service.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.')) {
+                            parts.push(service);
+                        }
+                    }
+                    if let Some(consumer) = info.and_then(|d| d.pointer("/metadata/consumer")?.as_str()) {
+                        if consumer.strip_prefix("projects/").is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())) {
+                            parts.push(consumer);
+                        }
+                    }
+                    parts.join(" · ")
+                });
                 return Ok(QuotaData {
                     models: Vec::new(),
                     last_updated: now_timestamp(),
                     subscription_tier,
                     is_forbidden: true,
+                    forbidden_reason: detail,
                 });
             }
             last_error = format!("模型配额服务返回 HTTP {status}。");
@@ -3177,6 +3204,9 @@ async fn read_wsl_credential(only_running: bool) -> Result<String, String> {
 
 async fn detect_system_active_accounts(store: &AccountStore) -> HashMap<SwitchTarget, String> {
     let mut detected = HashMap::new();
+    if store.accounts.is_empty() {
+        return detected;
+    }
 
     // 1. Detect Desktop active account
     for db_path in import_state_db_candidates(Some(SwitchTarget::Desktop)) {
